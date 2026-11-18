@@ -1,0 +1,317 @@
+import {describe, it, expect, beforeAll} from 'vitest';
+import express from 'express';
+import http from 'node:http';
+import {
+  generateNumericOtp,
+  generateSecureQrToken,
+  hashOtp,
+  hashPassword,
+  sha256Hex,
+  signAccessToken,
+  verifyAccessToken,
+  verifyPassword,
+} from './crypto';
+import {ensureSeeded, getDb} from './db';
+import {createApiRouter} from './routes';
+
+async function requestJson(
+  baseUrl: string,
+  path: string,
+  options: RequestInit = {},
+): Promise<{status: number; data: Record<string, unknown>; headers: Headers; raw: ArrayBuffer}> {
+  const res = await fetch(`${baseUrl}${path}`, {
+    ...options,
+    headers: {
+      'Content-Type': 'application/json',
+      ...(options.headers || {}),
+    },
+  });
+  const raw = await res.arrayBuffer();
+  let data: Record<string, unknown> = {};
+  const ct = res.headers.get('content-type') || '';
+  if (ct.includes('application/json')) {
+    data = JSON.parse(Buffer.from(raw).toString('utf8')) as Record<string, unknown>;
+  }
+  return {status: res.status, data, headers: res.headers, raw};
+}
+
+describe('Secure QR Verification System — Crypto & API Integration', () => {
+  let server: http.Server;
+  let baseUrl: string;
+
+  beforeAll(async () => {
+    try {
+      (process as unknown as {loadEnvFile?: () => void}).loadEnvFile?.();
+    } catch {
+      // Optional .env file
+    }
+    getDb();
+    await ensureSeeded('http://localhost:3000');
+
+    const app = express();
+    app.use(express.json({limit: '4mb'}));
+    app.use('/api/v1', createApiRouter());
+
+    await new Promise<void>((resolve) => {
+      server = app.listen(0, () => {
+        const addr = server.address() as {port: number};
+        baseUrl = `http://127.0.0.1:${addr.port}`;
+        resolve();
+      });
+    });
+
+    return () => {
+      server.close();
+    };
+  });
+
+  it('hashes and verifies passwords with scrypt timing-safe equality', () => {
+    const hash = hashPassword('Str0ngPass!2026');
+    expect(hash).toContain(':');
+    expect(verifyPassword('Str0ngPass!2026', hash)).toBe(true);
+    expect(verifyPassword('WrongPass', hash)).toBe(false);
+  });
+
+  it('generates 256-bit QR tokens and verifies HMAC-hashed OTPs', () => {
+    const token = generateSecureQrToken();
+    expect(token.length).toBeGreaterThanOrEqual(42);
+    expect(sha256Hex(token)).toHaveLength(64);
+
+    const otp = generateNumericOtp();
+    expect(otp).toMatch(/^\d{6}$/);
+    expect(hashOtp('+15551234567', otp)).toBe(hashOtp('+15551234567', otp));
+    expect(hashOtp('+15551234567', otp)).not.toBe(hashOtp('+15559999999', otp));
+  });
+
+  it('signs and verifies HS256 JWT access tokens', () => {
+    const jwt = signAccessToken({
+      sub: 1,
+      email: 'superadmin@secureqr.gov',
+      role: 'SUPER_ADMIN',
+      permissions: ['can_scan_qr'],
+    });
+    const decoded = verifyAccessToken(jwt);
+    expect(decoded?.sub).toBe(1);
+    expect(decoded?.role).toBe('SUPER_ADMIN');
+    expect(verifyAccessToken(`${jwt}tampered`)).toBeNull();
+  });
+
+  it('enforces RBAC, completes OTP -> Registration -> Admin Approval -> QR Verification -> Revoke -> Excel Export', async () => {
+    const uniqueSuffix = Date.now().toString().slice(-6);
+    const mobile = `+15559${uniqueSuffix}`;
+    const email = `applicant.${uniqueSuffix}@test.org`;
+
+    // 1. Duplicate check works
+    const dupRes = await requestJson(baseUrl, '/api/v1/auth/check-availability', {
+      method: 'POST',
+      body: JSON.stringify({email: 'aarav.sharma@enterprise.org', mobile: '+15550101001'}),
+    });
+    expect(dupRes.status).toBe(200);
+    expect(dupRes.data['emailAvailable']).toBe(false);
+    expect(dupRes.data['mobileAvailable']).toBe(false);
+
+    // 2. Send OTP & Verify OTP
+    const sendOtpRes = await requestJson(baseUrl, '/api/v1/auth/otp/send', {
+      method: 'POST',
+      body: JSON.stringify({mobile, purpose: 'REGISTRATION'}),
+    });
+    expect(sendOtpRes.status).toBe(200);
+    const hintOtp = String(sendOtpRes.data['devOtpHint']);
+    expect(hintOtp).toMatch(/^\d{6}$/);
+
+    // Invalid OTP attempt increments failure
+    const badVerify = await requestJson(baseUrl, '/api/v1/auth/otp/verify', {
+      method: 'POST',
+      body: JSON.stringify({mobile, otp: '000000'}),
+    });
+    expect(badVerify.status).toBe(400);
+
+    const goodVerify = await requestJson(baseUrl, '/api/v1/auth/otp/verify', {
+      method: 'POST',
+      body: JSON.stringify({mobile, otp: hintOtp}),
+    });
+    expect(goodVerify.status).toBe(200);
+    const otpVerificationId = Number(goodVerify.data['otpVerificationId']);
+
+    // 3. Submit Registration (1x1 transparent PNG data URL)
+    const samplePng =
+      'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
+
+    const regRes = await requestJson(baseUrl, '/api/v1/auth/register', {
+      method: 'POST',
+      body: JSON.stringify({
+        fullName: 'Test Applicant',
+        email,
+        password: 'Password@2026',
+        mobile,
+        otpVerificationId,
+        address: '100 Market St',
+        city: 'San Francisco',
+        district: 'SF',
+        state: 'California',
+        country: 'United States',
+        postalCode: '94105',
+        idProofType: 'National Passport',
+        profilePhotoData: samplePng,
+        idProofData: samplePng,
+        dynamicFields: {organization: 'QA Labs', access_tier: 'Standard Member'},
+        consentAccepted: true,
+      }),
+    });
+    expect(regRes.status).toBe(201);
+    expect(regRes.data['status']).toBe('PENDING');
+    const regId = String(regRes.data['registrationId']);
+
+    // 4. User Login & RBAC check (User must be denied Admin routes)
+    const userLogin = await requestJson(baseUrl, '/api/v1/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({identifier: email, password: 'Password@2026'}),
+    });
+    expect(userLogin.status).toBe(200);
+    const userToken = String(userLogin.data['accessToken']);
+
+    const forbiddenAdmin = await requestJson(baseUrl, '/api/v1/admin/dashboard/stats', {
+      headers: {Authorization: `Bearer ${userToken}`},
+    });
+    expect(forbiddenAdmin.status).toBe(403);
+
+    // Pending user cannot download QR yet
+    const pendingQrDownload = await requestJson(baseUrl, '/api/v1/user/qr/download', {
+      headers: {Authorization: `Bearer ${userToken}`},
+    });
+    expect(pendingQrDownload.status).toBe(403);
+
+    // 5. Super Admin Login, Find Pending Record, Approve & Issue QR
+    const adminLogin = await requestJson(baseUrl, '/api/v1/auth/admin/login', {
+      method: 'POST',
+      body: JSON.stringify({identifier: 'superadmin@secureqr.gov', password: 'SuperAdmin@2026!'}),
+    });
+    expect(adminLogin.status).toBe(200);
+    const adminToken = String(adminLogin.data['accessToken']);
+
+    const listRes = await requestJson(
+      baseUrl,
+      `/api/v1/admin/registrations?search=${encodeURIComponent(regId)}`,
+      {headers: {Authorization: `Bearer ${adminToken}`}},
+    );
+    expect(listRes.status).toBe(200);
+    const items = listRes.data['items'] as {id: number}[];
+    expect(items.length).toBe(1);
+    const recordId = items[0].id;
+
+    const approveRes = await requestJson(baseUrl, `/api/v1/admin/registrations/${recordId}/approve`, {
+      method: 'POST',
+      headers: {Authorization: `Bearer ${adminToken}`},
+      body: JSON.stringify({note: 'Automated test approval'}),
+    });
+    expect(approveRes.status).toBe(200);
+    expect(approveRes.data['status']).toBe('APPROVED');
+
+    // 6. User fetches dashboard & active QR verification URL, downloads QR PNG
+    const userDash = await requestJson(baseUrl, '/api/v1/user/dashboard', {
+      headers: {Authorization: `Bearer ${userToken}`},
+    });
+    expect(userDash.status).toBe(200);
+    const activeQr = userDash.data['activeQr'] as {id: number; verification_url: string};
+    expect(activeQr).toBeTruthy();
+
+    const qrPng = await requestJson(baseUrl, '/api/v1/user/qr/download', {
+      headers: {Authorization: `Bearer ${userToken}`},
+    });
+    expect(qrPng.status).toBe(200);
+    expect(qrPng.headers.get('content-type')).toContain('image/png');
+
+    // 7. Admin verifies QR -> VALID QR, Invalid token -> INVALID QR, Revoke -> REVOKED QR
+    const verifyValid = await requestJson(baseUrl, '/api/v1/admin/verify-qr', {
+      method: 'POST',
+      headers: {Authorization: `Bearer ${adminToken}`},
+      body: JSON.stringify({payload: activeQr.verification_url}),
+    });
+    expect(verifyValid.status).toBe(200);
+    expect(verifyValid.data['resultStatus']).toBe('VALID');
+
+    const verifyInvalid = await requestJson(baseUrl, '/api/v1/admin/verify-qr', {
+      method: 'POST',
+      headers: {Authorization: `Bearer ${adminToken}`},
+      body: JSON.stringify({payload: 'https://example.com/verify?token=nonexistent_fake_token'}),
+    });
+    expect(verifyInvalid.status).toBe(200);
+    expect(verifyInvalid.data['resultStatus']).toBe('INVALID');
+
+    const revokeRes = await requestJson(baseUrl, `/api/v1/admin/qrs/${activeQr.id}/revoke`, {
+      method: 'POST',
+      headers: {Authorization: `Bearer ${adminToken}`},
+      body: JSON.stringify({reason: 'Test revocation'}),
+    });
+    expect(revokeRes.status).toBe(200);
+
+    const verifyRevoked = await requestJson(baseUrl, '/api/v1/admin/verify-qr', {
+      method: 'POST',
+      headers: {Authorization: `Bearer ${adminToken}`},
+      body: JSON.stringify({payload: activeQr.verification_url}),
+    });
+    expect(verifyRevoked.status).toBe(200);
+    expect(verifyRevoked.data['resultStatus']).toBe('REVOKED');
+
+    // 8. Admin Excel Export returns valid XLSX binary
+    const excelRes = await requestJson(baseUrl, '/api/v1/admin/export/excel?status=APPROVED', {
+      headers: {Authorization: `Bearer ${adminToken}`},
+    });
+    expect(excelRes.status).toBe(200);
+    expect(excelRes.headers.get('content-type')).toContain(
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    );
+    expect(excelRes.raw.byteLength).toBeGreaterThan(1000);
+  });
+
+  it('authenticates fixed Super Admin, inspects DB/gateway status, and logs 24h Excel email dispatch', async () => {
+    const fixedEmail = process.env['FIXED_ADMIN_EMAIL'] || 'kishore.sathayush@gmail.com';
+    const fixedPassword = process.env['FIXED_ADMIN_PASSWORD'] || '';
+    expect(fixedPassword.length).toBeGreaterThan(0);
+
+    const fixedLogin = await requestJson(baseUrl, '/api/v1/auth/admin/login', {
+      method: 'POST',
+      body: JSON.stringify({identifier: fixedEmail, password: fixedPassword}),
+    });
+    expect(fixedLogin.status).toBe(200);
+    const fixedToken = String(fixedLogin.data['accessToken']);
+    expect(fixedToken.length).toBeGreaterThan(20);
+
+    const dbStatus = await requestJson(baseUrl, '/api/v1/admin/settings/db-status', {
+      headers: {Authorization: `Bearer ${fixedToken}`},
+    });
+    expect(dbStatus.status).toBe(200);
+    const dbInfo = dbStatus.data['database'] as Record<string, unknown>;
+    const integrations = dbStatus.data['integrations'] as Record<string, unknown>;
+    expect(dbInfo['database']).toBe('secure_qr_verification');
+    expect(integrations['fixedAdminEmail']).toBe('kishore.sathayush@gmail.com');
+    expect(integrations['smsSender']).toBe('STYUSH');
+    expect(integrations['s3Configured']).toBe(true);
+    expect(integrations['filePath']).toBe('https://sathayushstorage.s3.ap-south-1.amazonaws.com/sathayush/');
+
+    const initMysql = await requestJson(baseUrl, '/api/v1/admin/settings/init-mysql', {
+      method: 'POST',
+      headers: {Authorization: `Bearer ${fixedToken}`},
+    });
+    expect(initMysql.status).toBe(200);
+    expect(initMysql.data['database']).toBe('secure_qr_verification');
+
+    const sendEmailRes = await requestJson(baseUrl, '/api/v1/admin/export/send-email-now', {
+      method: 'POST',
+      headers: {Authorization: `Bearer ${fixedToken}`},
+    });
+    expect(sendEmailRes.status).toBe(200);
+    expect(sendEmailRes.data['recipient']).toBe('kishore.sathayush@gmail.com');
+    expect(Number(sendEmailRes.data['recordCount'])).toBeGreaterThanOrEqual(5);
+
+    const logsRes = await requestJson(baseUrl, '/api/v1/admin/export/scheduled-logs', {
+      headers: {Authorization: `Bearer ${fixedToken}`},
+    });
+    expect(logsRes.status).toBe(200);
+    expect(logsRes.data['recipientEmail']).toBe('kishore.sathayush@gmail.com');
+    expect(logsRes.data['scheduleIntervalHours']).toBe(24);
+    const logs = logsRes.data['logs'] as Record<string, unknown>[];
+    expect(logs.length).toBeGreaterThanOrEqual(1);
+    expect(logs[0]['trigger_type']).toBe('MANUAL');
+  }, 20000);
+});

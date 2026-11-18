@@ -1,0 +1,46 @@
+{
+  "info": {
+    "name": "Secure QR Verification System API",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Auth - Send OTP",
+      "request": {
+        "method": "POST",
+        "url": "{{baseUrl}}/api/v1/auth/otp/send",
+        "body": { "mode": "raw", "raw": "{\"mobile\": \"+15550199999\", \"purpose\": \"REGISTRATION\"}" }
+      }
+    },
+    {
+      "name": "Auth - Admin Login",
+      "request": {
+        "method": "POST",
+        "url": "{{baseUrl}}/api/v1/auth/admin/login",
+        "body": { "mode": "raw", "raw": "{\"identifier\": \"superadmin@secureqr.gov\", \"password\": \"SuperAdmin@2026!\"}" }
+      }
+    },
+    {
+      "name": "Admin - Approve Registration",
+      "request": {
+        "method": "POST",
+        "url": "{{baseUrl}}/api/v1/admin/registrations/2/approve"
+      }
+    },
+    {
+      "name": "Admin - Verify QR",
+      "request": {
+        "method": "POST",
+        "url": "{{baseUrl}}/api/v1/admin/verify-qr",
+        "body": { "mode": "raw", "raw": "{\"payload\": \"https://host/verify?token=...\"}" }
+      }
+    },
+    {
+      "name": "Admin - Export Excel",
+      "request": {
+        "method": "GET",
+        "url": "{{baseUrl}}/api/v1/admin/export/excel?status=APPROVED"
+      }
+    }
+  ]
+}

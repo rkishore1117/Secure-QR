@@ -1,0 +1,93 @@
+@import url('https://fonts.googleapis.com/icon?family=Material+Icons');
+@import "tailwindcss";
+
+:root {
+  --navy-950: #071124;
+  --navy-900: #0F172A;
+  --navy-800: #162442;
+  --navy-700: #1E3A5F;
+  --navy-600: #284B7A;
+  --surface-canvas: #F8FAFC;
+  --surface-card: #FFFFFF;
+  --border-hairline: #E2E8F0;
+  --font-display: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+  --font-body: 'DM Sans', system-ui, -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+}
+
+@layer base {
+  html {
+    font-family: var(--font-body);
+    scroll-behavior: smooth;
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    margin: 0;
+    background-color: var(--surface-canvas);
+    color: var(--navy-900);
+    overflow-x: hidden;
+  }
+
+  h1, h2, h3, h4, .font-display {
+    font-family: var(--font-display);
+  }
+
+  .font-mono, code, pre {
+    font-family: var(--font-mono);
+  }
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+.text-balance {
+  text-wrap: balance;
+}
+
+.fluid-hero-title {
+  font-size: clamp(1.85rem, 3.6vw, 3.25rem);
+  line-height: 1.12;
+  letter-spacing: -0.025em;
+}
+
+.fluid-page-title {
+  font-size: clamp(1.375rem, 2.1vw, 1.875rem);
+  line-height: 1.2;
+  letter-spacing: -0.02em;
+}
+
+.touch-target {
+  min-height: 44px;
+  min-width: 44px;
+}
+
+.safe-area-bottom {
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+@media print {
+  body * {
+    visibility: hidden;
+  }
+  .printable-id-card,
+  .printable-id-card * {
+    visibility: visible;
+  }
+  .printable-id-card {
+    position: fixed;
+    left: 50%;
+    top: 24px;
+    transform: translateX(-50%);
+    box-shadow: none !important;
+  }
+}

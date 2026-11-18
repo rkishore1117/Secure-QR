@@ -1,0 +1,6 @@
+{
+  "name": "Secure QR Verification System",
+  "description": "Enterprise identity registration, OTP verification, admin approval, cryptographic QR credential issuance, live verification scanner, and Excel reporting platform.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

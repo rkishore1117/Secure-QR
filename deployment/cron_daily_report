@@ -1,0 +1,3 @@
+# Cron schedule for 24-hour automated user verification Excel report
+# Runs daily at 00:00 UTC and emails the workbook to DAILY_REPORT_RECIPIENT_EMAIL
+0 0 * * * root cd /app/backend && /usr/local/bin/python manage.py send_daily_verification_excel >> /var/log/secureqr_daily_report.log 2>&1
