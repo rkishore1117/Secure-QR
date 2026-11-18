@@ -59,6 +59,7 @@ export async function uploadBase64Media(
   const bucket = getEnvValue('AWS_STORAGE_BUCKET_NAME');
   const filePathBase =
     getEnvValue('FILE_PATH') ||
+    getEnvValue('File_path') ||
     (bucket ? `https://${bucket}.s3.${region}.amazonaws.com/sathayush/` : '');
 
   const normalizedBase = filePathBase.endsWith('/') ? filePathBase : `${filePathBase}/`;
