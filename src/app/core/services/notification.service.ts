@@ -21,6 +21,9 @@ export class NotificationService {
     () => this.notifications().filter((n) => !n.is_read).length,
   );
   readonly wsConnected = signal<boolean>(false);
+  readonly registrationEventTick = signal<number>(0);
+
+  private lastSeenLatestId = 0;
 
   constructor() {
     effect(() => {
@@ -45,6 +48,26 @@ export class NotificationService {
       const res = this.auth.isAdmin()
         ? await firstValueFrom(this.api.getAdminNotifications())
         : await firstValueFrom(this.api.getUserNotifications());
+      const latestId = res.notifications[0]?.id ?? 0;
+      if (this.lastSeenLatestId > 0 && latestId > this.lastSeenLatestId) {
+        const hasRegChange = res.notifications.some(
+          (n) =>
+            n.id > this.lastSeenLatestId &&
+            [
+              'NEW_REGISTRATION',
+              'RESUBMISSION',
+              'REGISTRATION_APPROVED',
+              'REGISTRATION_REJECTED',
+              'RESUBMISSION_REQUIRED',
+            ].includes(n.type),
+        );
+        if (hasRegChange) {
+          this.registrationEventTick.update((v) => v + 1);
+        }
+      }
+      if (latestId > this.lastSeenLatestId) {
+        this.lastSeenLatestId = latestId;
+      }
       this.notifications.set(res.notifications);
     } catch {
       // Silent retry on next poll
@@ -113,6 +136,20 @@ export class NotificationService {
               incoming,
               ...list.filter((n) => n.id !== incoming.id),
             ]);
+            if (incoming.id > this.lastSeenLatestId) {
+              this.lastSeenLatestId = incoming.id;
+            }
+            if (
+              [
+                'NEW_REGISTRATION',
+                'RESUBMISSION',
+                'REGISTRATION_APPROVED',
+                'REGISTRATION_REJECTED',
+                'RESUBMISSION_REQUIRED',
+              ].includes(incoming.type)
+            ) {
+              this.registrationEventTick.update((v) => v + 1);
+            }
             this.toast.info(incoming.title, incoming.message);
           }
         } catch {

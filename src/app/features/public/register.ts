@@ -94,6 +94,13 @@ import {DynamicFieldConfig} from '../../core/models/types';
             </p>
           </div>
 
+          @if (runtimeNotice(); as notice) {
+            <div class="mb-6 rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-xs text-amber-900">
+              <p class="font-semibold">Runtime Configuration Notice</p>
+              <p class="mt-1 leading-relaxed">{{ notice }}</p>
+            </div>
+          }
+
           <form [formGroup]="form" (ngSubmit)="submitRegistration()" class="space-y-6">
             <!-- Section 1: Account & Identity -->
             <section class="rounded-xl border border-slate-200 bg-white p-5 sm:p-6">
@@ -239,27 +246,18 @@ import {DynamicFieldConfig} from '../../core/models/types';
                 }
               </div>
 
+              @if (otpErrorMsg()) {
+                <div class="mt-3 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-xs font-medium text-red-800">
+                  {{ otpErrorMsg() }}
+                </div>
+              }
+
               @if (otpSent() && !otpVerifiedId()) {
                 <div class="mt-4 rounded-lg border border-slate-200 bg-slate-50 p-4 space-y-2">
                   @if (emailNotice()) {
                     <p class="text-xs font-medium text-slate-700">
                       {{ emailNotice() }}
                     </p>
-                  }
-                  @if (devOtpHint()) {
-                    <div class="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
-                      <div>
-                        <span class="font-medium">One-Time Verification Code: </span>
-                        <span class="font-mono text-sm font-bold tracking-wider text-[#0F172A]">{{ devOtpHint() }}</span>
-                      </div>
-                      <button
-                        type="button"
-                        (click)="applyDevOtpHint()"
-                        class="rounded-md border border-amber-300 bg-white px-2.5 py-1 text-[11px] font-semibold text-amber-900 hover:bg-amber-100"
-                      >
-                        Use Code
-                      </button>
-                    </div>
                   }
                   <div class="flex flex-col gap-3 sm:flex-row sm:items-end">
                     <div class="flex-1 max-w-xs">
@@ -520,8 +518,9 @@ export class Register implements OnInit, OnDestroy {
   protected readonly sendingOtp = signal(false);
   protected readonly verifyingOtp = signal(false);
   protected readonly otpVerifiedId = signal<number | null>(null);
-  protected readonly devOtpHint = signal<string | null>(null);
+  protected readonly otpErrorMsg = signal<string | null>(null);
   protected readonly emailNotice = signal<string | null>(null);
+  protected readonly runtimeNotice = signal<string | null>(null);
   protected readonly resendCooldown = signal(0);
 
   protected readonly photoPreview = signal<string | null>(null);
@@ -565,7 +564,7 @@ export class Register implements OnInit, OnDestroy {
       if (!this.otpVerifiedId() && this.lastOtpEmail && normalized !== this.lastOtpEmail) {
         this.otpSent.set(false);
         this.emailNotice.set(null);
-        this.devOtpHint.set(null);
+        this.otpErrorMsg.set(null);
         this.resendCooldown.set(0);
         this.form.patchValue({otpCode: ''}, {emitEvent: false});
         if (this.cooldownTimer) {
@@ -576,7 +575,10 @@ export class Register implements OnInit, OnDestroy {
     });
 
     try {
-      const cfg = await firstValueFrom(this.api.getPublicFieldConfigs());
+      const [cfg, health] = await Promise.all([
+        firstValueFrom(this.api.getPublicFieldConfigs()),
+        firstValueFrom(this.api.getPublicHealth()).catch(() => null),
+      ]);
       this.organizationName.set(cfg.organizationName);
       this.idProofRequired.set(cfg.idProofRequired);
       this.dynamicFields.set(cfg.fields);
@@ -586,6 +588,21 @@ export class Register implements OnInit, OnDestroy {
           f.fieldKey,
           this.fb.control('', f.isRequired ? Validators.required : []),
         );
+      }
+
+      if (health && (!health.databaseConnected || !health.emailConfigured)) {
+        const issues: string[] = [];
+        if (!health.databaseConnected) {
+          issues.push(
+            'Live MySQL database credentials (DB_HOST, DB_USER, DB_PASSWORD, DB_NAME) are not configured on this host — applications on this instance will not reach your shared AWS RDS Admin Panel.',
+          );
+        }
+        if (!health.emailConfigured) {
+          issues.push(
+            'Email OTP relay (EMAIL_HOST_USER/EMAIL_HOST_PASSWORD or BREVO_API_KEY/EMAIL_WEBHOOK_URL) is not configured on this host.',
+          );
+        }
+        this.runtimeNotice.set(issues.join(' '));
       }
     } catch {
       // keep base form functional
@@ -621,39 +638,29 @@ export class Register implements OnInit, OnDestroy {
     }
     this.sendingOtp.set(true);
     this.emailNotice.set(null);
+    this.otpErrorMsg.set(null);
     try {
       const res = await firstValueFrom(this.api.sendOtp(email, 'REGISTRATION'));
-      this.lastOtpEmail = email;
-      this.otpSent.set(true);
-      this.devOtpHint.set(!res.emailDispatched && res.devOtpHint ? res.devOtpHint : null);
       if (res.emailDispatched) {
+        this.lastOtpEmail = email;
+        this.otpSent.set(true);
         const notice = `A 6-digit verification code has been sent to ${email}. Check your inbox or spam folder.`;
         this.emailNotice.set(notice);
         this.toast.success('Email OTP Sent', `Verification code sent to ${email}.`);
-      } else if (res.devOtpHint) {
-        const notice =
-          res.message ||
-          'External email relay is not configured on this runtime — use the 6-digit verification code below to continue.';
-        this.emailNotice.set(notice);
-        this.toast.info('Verification Code Ready', 'Use the on-screen 6-digit code to verify your email and continue.');
+        this.startCooldown(30);
       } else {
         const notice = `Could not deliver verification email (${res.emailError || 'Email service unavailable'}).`;
-        this.emailNotice.set(notice);
-        this.toast.error('Email Delivery Notice', notice);
+        this.otpSent.set(false);
+        this.otpErrorMsg.set(notice);
+        this.toast.error('Email Delivery Failed', notice);
       }
-      this.startCooldown(30);
     } catch (err: unknown) {
       const msg = (err as {error?: {error?: string}})?.error?.error || 'Could not send email OTP.';
+      this.otpSent.set(false);
+      this.otpErrorMsg.set(msg);
       this.toast.error('OTP Error', msg);
     } finally {
       this.sendingOtp.set(false);
-    }
-  }
-
-  applyDevOtpHint(): void {
-    const code = this.devOtpHint();
-    if (code) {
-      this.form.patchValue({otpCode: code});
     }
   }
 

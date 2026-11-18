@@ -1,9 +1,10 @@
-import {ChangeDetectionStrategy, Component, OnInit, inject, signal} from '@angular/core';
+import {ChangeDetectionStrategy, Component, OnInit, effect, inject, signal} from '@angular/core';
 import {DatePipe} from '@angular/common';
 import {RouterLink} from '@angular/router';
 import {MatIconModule} from '@angular/material/icon';
 import {firstValueFrom} from 'rxjs';
 import {ApiService} from '../../core/services/api.service';
+import {NotificationService} from '../../core/services/notification.service';
 import {DashboardStats, UserRecord} from '../../core/models/types';
 import {StatusText} from '../../shared/components/status-text';
 
@@ -21,6 +22,15 @@ import {StatusText} from '../../shared/components/status-text';
           </p>
         </div>
         <div class="flex flex-wrap gap-2">
+          <button
+            type="button"
+            (click)="loadDashboard()"
+            [disabled]="loading()"
+            class="touch-target inline-flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-4 py-2 text-xs font-semibold text-slate-800 hover:bg-slate-50 disabled:opacity-50 whitespace-nowrap"
+          >
+            <mat-icon class="text-[18px]!">refresh</mat-icon>
+            <span>Refresh</span>
+          </button>
           <a
             routerLink="/admin/registrations"
             [queryParams]="{status: 'PENDING'}"
@@ -38,6 +48,24 @@ import {StatusText} from '../../shared/components/status-text';
           </a>
         </div>
       </div>
+
+      @if (fallbackDbNotice()) {
+        <div class="rounded-xl border border-amber-300 bg-amber-50 p-4 flex flex-wrap items-center justify-between gap-3 text-xs text-amber-900">
+          <div>
+            <p class="font-semibold">In-Memory Fallback Database Active</p>
+            <p class="mt-0.5 leading-relaxed">
+              This runtime is not connected to your AWS MySQL RDS database (DB_HOST / DB_USER / DB_PASSWORD missing). Member registrations on other environments will not sync until RDS credentials are configured.
+            </p>
+          </div>
+          <a
+            routerLink="/admin/settings"
+            class="touch-target inline-flex items-center gap-1.5 rounded-lg border border-amber-300 bg-white px-3.5 py-2 font-semibold text-amber-900 hover:bg-amber-100 whitespace-nowrap"
+          >
+            <mat-icon class="text-[16px]!">settings</mat-icon>
+            <span>System Settings</span>
+          </a>
+        </div>
+      }
 
       @if (loading()) {
         <div class="grid grid-cols-2 gap-3 sm:grid-cols-2 md:grid-cols-4">
@@ -107,24 +135,30 @@ import {StatusText} from '../../shared/components/status-text';
             </a>
           </div>
           <div class="divide-y divide-slate-100">
-            @for (r of recentRegistrations(); track r.id) {
-              <div class="flex items-center justify-between gap-3 px-5 py-3 hover:bg-slate-50">
-                <div class="flex items-center gap-3 min-w-0">
-                  <img
-                    [src]="r.profile_photo_url"
-                    [alt]="r.full_name"
-                    class="h-9 w-9 shrink-0 rounded-lg object-cover border border-slate-200"
-                    referrerpolicy="no-referrer"
-                  />
-                  <div class="min-w-0">
-                    <p class="truncate text-sm font-semibold text-slate-900">{{ r.full_name }}</p>
-                    <p class="truncate font-mono text-[11px] text-slate-500 tabular-nums">
-                      {{ r.registration_id }} · {{ r.city }}, {{ r.state }}
-                    </p>
+            @if (recentRegistrations().length === 0) {
+              <p class="p-6 text-xs text-slate-500">
+                No member registrations yet. New applications from the User Registration portal will appear here automatically.
+              </p>
+            } @else {
+              @for (r of recentRegistrations(); track r.id) {
+                <div class="flex items-center justify-between gap-3 px-5 py-3 hover:bg-slate-50">
+                  <div class="flex items-center gap-3 min-w-0">
+                    <img
+                      [src]="r.profile_photo_url"
+                      [alt]="r.full_name"
+                      class="h-9 w-9 shrink-0 rounded-lg object-cover border border-slate-200"
+                      referrerpolicy="no-referrer"
+                    />
+                    <div class="min-w-0">
+                      <p class="truncate text-sm font-semibold text-slate-900">{{ r.full_name }}</p>
+                      <p class="truncate font-mono text-[11px] text-slate-500 tabular-nums">
+                        {{ r.registration_id }} · {{ r.city }}, {{ r.state }}
+                      </p>
+                    </div>
                   </div>
+                  <app-status-text [status]="r.approval_status" />
                 </div>
-                <app-status-text [status]="r.approval_status" />
-              </div>
+              }
             }
           </div>
         </section>
@@ -162,12 +196,23 @@ import {StatusText} from '../../shared/components/status-text';
 })
 export class AdminDashboard implements OnInit {
   private readonly api = inject(ApiService);
+  private readonly notif = inject(NotificationService);
 
   protected readonly loading = signal(true);
   protected readonly errorMsg = signal<string | null>(null);
+  protected readonly fallbackDbNotice = signal(false);
   protected readonly stats = signal<DashboardStats | null>(null);
   protected readonly recentRegistrations = signal<UserRecord[]>([]);
   protected readonly recentScans = signal<Record<string, unknown>[]>([]);
+
+  constructor() {
+    effect(() => {
+      const tick = this.notif.registrationEventTick();
+      if (tick > 0) {
+        void this.loadDashboard();
+      }
+    });
+  }
 
   ngOnInit(): void {
     void this.loadDashboard();
@@ -177,10 +222,16 @@ export class AdminDashboard implements OnInit {
     this.loading.set(true);
     this.errorMsg.set(null);
     try {
-      const res = await firstValueFrom(this.api.getAdminDashboardStats());
+      const [res, health] = await Promise.all([
+        firstValueFrom(this.api.getAdminDashboardStats()),
+        firstValueFrom(this.api.getPublicHealth()).catch(() => null),
+      ]);
       this.stats.set(res.stats);
       this.recentRegistrations.set(res.recentRegistrations);
       this.recentScans.set(res.recentScans);
+      if (health) {
+        this.fallbackDbNotice.set(!health.databaseConnected);
+      }
     } catch (err: unknown) {
       const msg = (err as {error?: {error?: string}})?.error?.error || 'Could not load dashboard metrics.';
       this.errorMsg.set(msg);

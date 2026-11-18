@@ -3,11 +3,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import QRCode from 'qrcode';
 import {
+  ensureFixedAdmin,
   ensureSeeded,
   executeSql,
   getEnvValue,
   getMysqlConfig,
   getUploadsDir,
+  isMockDbActive,
   parseJsonSafe,
   queryOne,
   queryRows,
@@ -396,6 +398,19 @@ export function createApiRouter(): express.Router {
     }
   });
 
+  // Public runtime health check (non-PII, no secrets)
+  router.get('/public/health', async (_req: Request, res: Response) => {
+    const cfg = getMysqlConfig();
+    const emailCfg = await getEffectiveEmailDeliveryConfig();
+    res.json({
+      databaseConnected: !isMockDbActive(),
+      databaseEngine: isMockDbActive() ? 'in-memory-fallback' : 'mysql-rds',
+      databaseName: cfg.database,
+      emailConfigured: emailCfg.configured,
+      emailProvider: emailCfg.mode,
+    });
+  });
+
   // Public field configuration & settings
   router.get('/public/field-configs', async (_req: Request, res: Response) => {
     const rows = await queryRows<{
@@ -594,24 +609,30 @@ export function createApiRouter(): express.Router {
         purpose,
       );
 
-      const isNonProd = process.env['NODE_ENV'] !== 'production';
+      const isTestRuntime = Boolean(process.env['VITEST']);
       const hintSettingRaw = getEnvValue('ALLOW_DEV_OTP_HINT').toLowerCase();
-      const requireExternalEmail = getEnvValue('REQUIRE_EXTERNAL_EMAIL').toLowerCase() === 'true';
-      const hintAllowedByConfig =
-        hintSettingRaw === 'true' || (hintSettingRaw !== 'false' && !requireExternalEmail);
+      const allowDevHint = isTestRuntime || hintSettingRaw === 'true';
 
-      // Registration allows graceful on-screen verification fallback when published without an email relay configured yet,
-      // unless strict external email delivery is enforced. Password reset only allows on-screen hint in non-prod/test or explicit opt-in.
-      const allowDevHint =
-        (!emailResult.dispatched || Boolean(process.env['VITEST'])) &&
-        hintAllowedByConfig &&
-        (purpose === 'REGISTRATION'
-          ? !emailResult.configured || isNonProd || hintSettingRaw === 'true'
-          : isNonProd || hintSettingRaw === 'true');
+      if (!emailResult.dispatched && !allowDevHint) {
+        // Delete unsent OTP record so resend cooldown does not block retry after fixing email config
+        await executeSql('DELETE FROM otp_verifications WHERE id = ?', [Number(insertRes.insertId)]);
+        const statusCode = emailResult.configured ? 502 : 503;
+        const errorMessage = emailResult.configured
+          ? `Could not deliver verification email (${emailResult.error || 'Email delivery failed'}).`
+          : 'No email delivery provider is configured on this server. Configure EMAIL_HOST_USER / EMAIL_HOST_PASSWORD or an HTTPS relay (BREVO_API_KEY / EMAIL_WEBHOOK_URL) in environment variables or Admin Settings.';
+        res.status(statusCode).json({
+          error: errorMessage,
+          emailDispatched: false,
+          emailConfigured: emailResult.configured,
+          emailProvider: emailResult.provider,
+          emailError: emailResult.error || null,
+        });
+        return;
+      }
 
-      if (!emailResult.dispatched && isNonProd) {
+      if (!emailResult.dispatched && isTestRuntime) {
         console.log(
-          `[EMAIL OTP NOTICE] purpose=${purpose} email=${email} otp=${otp} | provider=${emailResult.provider} | err=${emailResult.error || 'none'}`,
+          `[EMAIL OTP TEST NOTICE] purpose=${purpose} email=${email} otp=${otp} | provider=${emailResult.provider} | err=${emailResult.error || 'none'}`,
         );
       }
 
@@ -621,9 +642,7 @@ export function createApiRouter(): express.Router {
         expiresInSeconds: expiryMinutes * 60,
         message: emailResult.dispatched
           ? `Verification code sent to ${email}.`
-          : allowDevHint
-            ? `Email relay not configured on this runtime — use the one-time verification code to continue.`
-            : `Verification code generated, but email could not be delivered (${emailResult.error || 'Email service unavailable'}).`,
+          : `Verification code generated for test verification.`,
         emailProvider: emailResult.provider,
         emailDispatched: emailResult.dispatched,
         emailConfigured: emailResult.configured,
@@ -1002,7 +1021,7 @@ export function createApiRouter(): express.Router {
         return;
       }
 
-      const account = await queryOne<{
+      let account = await queryOne<{
         id: number;
         email: string;
         mobile: string;
@@ -1015,6 +1034,28 @@ export function createApiRouter(): express.Router {
          WHERE (LOWER(email) = ? OR mobile = ?) AND deleted_at IS NULL`,
         [identifier, identifier],
       );
+
+      if (!account && expectedPortal === 'ADMIN') {
+        const fixedAdminEmail = (getEnvValue('FIXED_ADMIN_EMAIL') || 'kishore.sathayush@gmail.com')
+          .trim()
+          .toLowerCase();
+        if (identifier === fixedAdminEmail) {
+          await ensureFixedAdmin();
+          account = await queryOne<{
+            id: number;
+            email: string;
+            mobile: string;
+            password_hash: string;
+            role: 'SUPER_ADMIN' | 'ADMIN' | 'USER';
+            is_active: number;
+            is_mobile_verified: number;
+          }>(
+            `SELECT * FROM user_accounts
+             WHERE (LOWER(email) = ? OR mobile = ?) AND deleted_at IS NULL`,
+            [identifier, identifier],
+          );
+        }
+      }
 
       if (!account || !verifyPassword(password, account.password_hash)) {
         res.status(401).json({error: 'Invalid credentials.'});
@@ -1626,10 +1667,10 @@ export function createApiRouter(): express.Router {
       unreadNotifications,
     ] = await Promise.all([
       countOf("SELECT COUNT(*) as c FROM user_accounts WHERE role = 'USER' AND deleted_at IS NULL"),
-      countOf("SELECT COUNT(*) as c FROM user_records WHERE approval_status = 'PENDING' AND deleted_at IS NULL"),
-      countOf("SELECT COUNT(*) as c FROM user_records WHERE approval_status = 'APPROVED' AND deleted_at IS NULL"),
-      countOf("SELECT COUNT(*) as c FROM user_records WHERE approval_status = 'REJECTED' AND deleted_at IS NULL"),
-      countOf("SELECT COUNT(*) as c FROM user_records WHERE approval_status = 'RESUBMISSION_REQUIRED' AND deleted_at IS NULL"),
+      countOf("SELECT COUNT(*) as c FROM user_records ur JOIN user_accounts ua ON ua.id = ur.user_id WHERE ur.approval_status = 'PENDING' AND ur.deleted_at IS NULL AND ua.deleted_at IS NULL"),
+      countOf("SELECT COUNT(*) as c FROM user_records ur JOIN user_accounts ua ON ua.id = ur.user_id WHERE ur.approval_status = 'APPROVED' AND ur.deleted_at IS NULL AND ua.deleted_at IS NULL"),
+      countOf("SELECT COUNT(*) as c FROM user_records ur JOIN user_accounts ua ON ua.id = ur.user_id WHERE ur.approval_status = 'REJECTED' AND ur.deleted_at IS NULL AND ua.deleted_at IS NULL"),
+      countOf("SELECT COUNT(*) as c FROM user_records ur JOIN user_accounts ua ON ua.id = ur.user_id WHERE ur.approval_status = 'RESUBMISSION_REQUIRED' AND ur.deleted_at IS NULL AND ua.deleted_at IS NULL"),
       countOf("SELECT COUNT(*) as c FROM qr_codes WHERE status = 'ACTIVE'"),
       countOf("SELECT COUNT(*) as c FROM qr_codes WHERE status = 'EXPIRED'"),
       countOf("SELECT COUNT(*) as c FROM qr_codes WHERE status = 'REVOKED'"),
@@ -1756,6 +1797,21 @@ export function createApiRouter(): express.Router {
         'SELECT DISTINCT city FROM user_records WHERE deleted_at IS NULL ORDER BY city ASC',
       );
 
+      const countRows = await queryRows<{approval_status: string; cnt: number}>(
+        `SELECT ur.approval_status, COUNT(*) as cnt
+         FROM user_records ur
+         JOIN user_accounts ua ON ua.id = ur.user_id
+         WHERE ur.deleted_at IS NULL AND ua.deleted_at IS NULL
+         GROUP BY ur.approval_status`,
+      );
+      const countsMap = new Map<string, number>();
+      let allCount = 0;
+      for (const cr of countRows) {
+        const c = Number(cr.cnt || 0);
+        countsMap.set(cr.approval_status, c);
+        allCount += c;
+      }
+
       res.json({
         items: rows.map((r) => ({
           ...r,
@@ -1765,6 +1821,13 @@ export function createApiRouter(): express.Router {
         total,
         page,
         pageSize,
+        counts: {
+          all: allCount,
+          pending: countsMap.get('PENDING') ?? 0,
+          approved: countsMap.get('APPROVED') ?? 0,
+          resubmission: countsMap.get('RESUBMISSION_REQUIRED') ?? 0,
+          rejected: countsMap.get('REJECTED') ?? 0,
+        },
         filters: {
           states: states.map((s) => s.state),
           cities: cities.map((c) => c.city),

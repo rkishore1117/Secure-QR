@@ -1,4 +1,4 @@
-import {ChangeDetectionStrategy, Component, OnInit, inject, signal} from '@angular/core';
+import {ChangeDetectionStrategy, Component, OnInit, effect, inject, signal} from '@angular/core';
 import {DatePipe} from '@angular/common';
 import {FormBuilder, ReactiveFormsModule} from '@angular/forms';
 import {ActivatedRoute} from '@angular/router';
@@ -6,6 +6,7 @@ import {MatIconModule} from '@angular/material/icon';
 import {firstValueFrom} from 'rxjs';
 import {ApiService} from '../../core/services/api.service';
 import {AuthService} from '../../core/services/auth.service';
+import {NotificationService} from '../../core/services/notification.service';
 import {ToastService} from '../../core/services/toast.service';
 import {QRCodeItem, UserRecord} from '../../core/models/types';
 import {StatusText} from '../../shared/components/status-text';
@@ -23,6 +24,15 @@ import {StatusText} from '../../shared/components/status-text';
             Review applications, inspect identity documents, approve with atomic QR issuance, reject, or request resubmission.
           </p>
         </div>
+        <button
+          type="button"
+          (click)="loadRegistrations(page())"
+          [disabled]="loading()"
+          class="touch-target inline-flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-4 py-2 text-xs font-semibold text-slate-800 hover:bg-slate-50 disabled:opacity-50 whitespace-nowrap"
+        >
+          <mat-icon class="text-[18px]!">refresh</mat-icon>
+          <span>Refresh Queue</span>
+        </button>
       </div>
 
       <!-- Segmented Status Tabs -->
@@ -37,7 +47,8 @@ import {StatusText} from '../../shared/components/status-text';
             [class.text-slate-600]="activeStatus() !== tab.value"
             [class.hover:bg-slate-100]="activeStatus() !== tab.value"
           >
-            {{ tab.label }}
+            <span>{{ tab.label }}</span>
+            <span class="ml-1.5 font-mono tabular-nums opacity-80">({{ tabCount(tab.value) }})</span>
           </button>
         }
       </div>
@@ -385,6 +396,7 @@ export class AdminRegistrations implements OnInit {
   private readonly api = inject(ApiService);
   protected readonly auth = inject(AuthService);
   private readonly route = inject(ActivatedRoute);
+  private readonly notif = inject(NotificationService);
   private readonly toast = inject(ToastService);
 
   protected readonly statusTabs = [
@@ -403,6 +415,13 @@ export class AdminRegistrations implements OnInit {
   protected readonly loading = signal(false);
   protected readonly availableStates = signal<string[]>([]);
   protected readonly availableCities = signal<string[]>([]);
+  protected readonly statusCounts = signal({
+    all: 0,
+    pending: 0,
+    approved: 0,
+    resubmission: 0,
+    rejected: 0,
+  });
 
   protected readonly selectedDetail = signal<{
     record: UserRecord;
@@ -422,12 +441,37 @@ export class AdminRegistrations implements OnInit {
     note: [''],
   });
 
+  constructor() {
+    effect(() => {
+      const tick = this.notif.registrationEventTick();
+      if (tick > 0) {
+        void this.loadRegistrations(this.page());
+      }
+    });
+  }
+
   ngOnInit(): void {
     this.route.queryParams.subscribe((params) => {
       const st = params['status'] || 'ALL';
       this.activeStatus.set(st);
       void this.loadRegistrations(1);
     });
+  }
+
+  tabCount(value: string): number {
+    const c = this.statusCounts();
+    switch (value) {
+      case 'PENDING':
+        return c.pending;
+      case 'APPROVED':
+        return c.approved;
+      case 'RESUBMISSION_REQUIRED':
+        return c.resubmission;
+      case 'REJECTED':
+        return c.rejected;
+      default:
+        return c.all;
+    }
   }
 
   setStatusFilter(status: string): void {
@@ -460,6 +504,9 @@ export class AdminRegistrations implements OnInit {
       this.page.set(res.page);
       this.availableStates.set(res.filters.states);
       this.availableCities.set(res.filters.cities);
+      if (res.counts) {
+        this.statusCounts.set(res.counts);
+      }
     } catch (err: unknown) {
       const msg = (err as {error?: {error?: string}})?.error?.error || 'Could not load registration records.';
       this.toast.error('Load Failed', msg);

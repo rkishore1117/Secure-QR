@@ -115,22 +115,6 @@ import {ToastService} from '../../core/services/toast.service';
                   </p>
                 </div>
 
-                @if (devOtpHint()) {
-                  <div class="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
-                    <div>
-                      <span class="font-medium">Verification Code: </span>
-                      <span class="font-mono text-sm font-bold tracking-wider text-[#0F172A]">{{ devOtpHint() }}</span>
-                    </div>
-                    <button
-                      type="button"
-                      (click)="applyDevOtpHint()"
-                      class="rounded-md border border-amber-300 bg-white px-2.5 py-1 text-[11px] font-semibold text-amber-900 hover:bg-amber-100"
-                    >
-                      Use Code
-                    </button>
-                  </div>
-                }
-
                 <div>
                   <label for="fp-otp" class="block text-xs font-semibold text-slate-700 mb-1.5">
                     6-Digit Verification Code
@@ -265,7 +249,6 @@ export class ForgotPassword implements OnInit, OnDestroy {
   protected readonly step = signal<1 | 2 | 3>(1);
   protected readonly verifiedEmail = signal('');
   protected readonly otpVerificationId = signal<number | null>(null);
-  protected readonly devOtpHint = signal<string | null>(null);
   protected readonly emailNotice = signal<string | null>(null);
   protected readonly resendCooldown = signal(0);
 
@@ -331,20 +314,17 @@ export class ForgotPassword implements OnInit, OnDestroy {
     this.sendingOtp.set(true);
     try {
       const res = await firstValueFrom(this.api.sendOtp(email, 'PASSWORD_RESET'));
-      this.verifiedEmail.set(email);
-      this.step.set(2);
-      this.devOtpHint.set(!res.emailDispatched && res.devOtpHint ? res.devOtpHint : null);
       if (res.emailDispatched) {
+        this.verifiedEmail.set(email);
+        this.step.set(2);
         this.emailNotice.set(`A 6-digit password reset code was sent to ${email}. Check your inbox or spam folder.`);
         this.toast.success('Reset Code Sent', `Verification code sent to ${email}.`);
-      } else if (res.devOtpHint) {
-        this.emailNotice.set(`Email delivery unavailable (${res.emailError || 'SMTP unavailable'}). Use the code below to continue.`);
-        this.toast.info('Reset Code Ready', 'Use the on-screen 6-digit verification code to continue.');
+        this.startCooldown(30);
       } else {
-        this.emailNotice.set(`Could not deliver email (${res.emailError || 'SMTP unavailable'}).`);
-        this.toast.error('Email Delivery Error', res.emailError || 'SMTP unavailable.');
+        const msg = `Could not deliver email (${res.emailError || 'Email delivery unavailable'}).`;
+        this.errorMsg.set(msg);
+        this.toast.error('Email Delivery Error', msg);
       }
-      this.startCooldown(30);
     } catch (err: unknown) {
       const msg = (err as {error?: {error?: string}})?.error?.error || 'Could not send reset code.';
       this.errorMsg.set(msg);
@@ -353,17 +333,9 @@ export class ForgotPassword implements OnInit, OnDestroy {
     }
   }
 
-  applyDevOtpHint(): void {
-    const code = this.devOtpHint();
-    if (code) {
-      this.otpForm.patchValue({otpCode: code});
-    }
-  }
-
   backToEmail(): void {
     this.errorMsg.set(null);
     this.otpForm.reset();
-    this.devOtpHint.set(null);
     this.emailNotice.set(null);
     this.step.set(1);
   }

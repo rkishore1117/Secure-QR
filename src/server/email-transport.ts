@@ -244,8 +244,12 @@ export class SmtpNodemailerTransport implements EmailTransport {
 
   private createTransport(ctx: EmailTransportContext, portOverride?: number) {
     const port = portOverride ?? ctx.smtpPort;
+    const host = ctx.smtpHost || 'smtp.gmail.com';
+    const pass = host.toLowerCase().includes('gmail.com')
+      ? ctx.smtpPassword.replace(/\s+/g, '')
+      : ctx.smtpPassword;
     return nodemailer.createTransport({
-      host: ctx.smtpHost || 'smtp.gmail.com',
+      host,
       port,
       secure: port === 465,
       requireTLS: ctx.smtpUseTls && port !== 465,
@@ -254,7 +258,7 @@ export class SmtpNodemailerTransport implements EmailTransport {
       socketTimeout: 9000,
       auth: {
         user: ctx.smtpUser,
-        pass: ctx.smtpPassword,
+        pass,
       },
     });
   }

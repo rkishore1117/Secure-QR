@@ -1,12 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import mysql from 'mysql2/promise';
-import QRCode from 'qrcode';
-import {
-  generateSecureQrToken,
-  hashPassword,
-  sha256Hex,
-} from './crypto';
+import {hashPassword} from './crypto';
 import {
   mockExecuteSql,
   mockQueryRows,
@@ -540,7 +535,7 @@ export async function ensureDbInitialized(): Promise<void> {
   return initPromise;
 }
 
-async function ensureFixedAdmin(): Promise<void> {
+export async function ensureFixedAdmin(): Promise<void> {
   loadEnvSafe();
   const fixedEmail = (getEnvValue('FIXED_ADMIN_EMAIL') || 'kishore.sathayush@gmail.com')
     .trim()
@@ -584,7 +579,7 @@ async function ensureFixedAdmin(): Promise<void> {
       );
     }
   } else {
-    const initialPassword = envPassword || 'SuperAdmin@2026!';
+    const initialPassword = envPassword || 'Admin@955';
     const mobileCandidate = getEnvValue('FIXED_ADMIN_MOBILE') || '+919550000955';
     const res = await executeSql(
       `INSERT INTO user_accounts
@@ -624,23 +619,13 @@ async function ensureFixedAdmin(): Promise<void> {
   }
 }
 
-export async function ensureSeeded(baseUrl = 'http://localhost:3000'): Promise<void> {
+export async function ensureSeeded(_baseUrl = 'http://localhost:3000'): Promise<void> {
+  void _baseUrl;
   if (seeded) return;
   if (seedingPromise) return seedingPromise;
 
   seedingPromise = (async () => {
     await ensureDbInitialized();
-
-    const existingCountRow = await queryOne<{cnt: number}>(
-      'SELECT COUNT(*) as cnt FROM user_accounts',
-    );
-    const existingCount = Number(existingCountRow?.cnt || 0);
-
-    if (existingCount > 0) {
-      await ensureFixedAdmin();
-      seeded = true;
-      return;
-    }
 
     const now = toMysqlDateTime();
 
@@ -674,7 +659,7 @@ export async function ensureSeeded(baseUrl = 'http://localhost:3000'): Promise<v
       );
     }
 
-    // System settings
+    // Default System Settings (never overwrite existing admin-saved settings)
     const defaultSettings: [string, string][] = [
       ['organization_name', 'Secure QR Verification Authority'],
       ['qr_validity_days', '365'],
@@ -691,441 +676,37 @@ export async function ensureSeeded(baseUrl = 'http://localhost:3000'): Promise<v
       );
     }
 
-    // Dynamic User Field Configs
-    const fieldSeeds: unknown[][] = [
-      ['organization', 'Organization / Employer', 'text', 1, 1, 1, '[]', 1],
-      ['department', 'Department / Division', 'text', 0, 1, 1, '[]', 2],
-      [
-        'access_tier',
-        'Credential Tier',
-        'select',
-        1,
-        1,
-        0,
-        JSON.stringify(['Standard Member', 'Facility Contractor', 'Executive Pass', 'Visitor Escort']),
-        3,
-      ],
-      ['emergency_contact', 'Emergency Contact Number', 'text', 0, 1, 1, '[]', 4],
-    ];
-    for (const f of fieldSeeds) {
-      await executeSql(
-        `INSERT IGNORE INTO user_field_configs
-          (field_key, label, field_type, is_required, is_enabled, is_editable_on_resubmit, options_json, sort_order)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-        f,
-      );
+    // Seed default dynamic registration fields only if table is empty
+    const fieldCountRow = await queryOne<{cnt: number}>(
+      'SELECT COUNT(*) as cnt FROM user_field_configs',
+    );
+    if (Number(fieldCountRow?.cnt || 0) === 0) {
+      const fieldSeeds: unknown[][] = [
+        ['organization', 'Organization / Employer', 'text', 1, 1, 1, '[]', 1],
+        ['department', 'Department / Division', 'text', 0, 1, 1, '[]', 2],
+        [
+          'access_tier',
+          'Credential Tier',
+          'select',
+          1,
+          1,
+          0,
+          JSON.stringify(['Standard Member', 'Facility Contractor', 'Executive Pass', 'Visitor Escort']),
+          3,
+        ],
+        ['emergency_contact', 'Emergency Contact Number', 'text', 0, 1, 1, '[]', 4],
+      ];
+      for (const f of fieldSeeds) {
+        await executeSql(
+          `INSERT IGNORE INTO user_field_configs
+            (field_key, label, field_type, is_required, is_enabled, is_editable_on_resubmit, options_json, sort_order)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          f,
+        );
+      }
     }
 
-    // Super Admin
-    const superAdminRes = await executeSql(
-      `INSERT INTO user_accounts
-        (email, mobile, password_hash, role, is_active, is_mobile_verified, created_at, updated_at)
-       VALUES (?, ?, ?, 'SUPER_ADMIN', 1, 1, ?, ?)`,
-      ['superadmin@secureqr.gov', '+15550100001', hashPassword('SuperAdmin@2026!'), now, now],
-    );
-    const superAdminId = Number(superAdminRes.insertId);
-
-    await executeSql(
-      `INSERT INTO admin_profiles
-        (user_id, full_name, department, designation, avatar_url, permissions_json, created_by, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        superAdminId,
-        'Eleanor Vance',
-        'Governance & Trust Operations',
-        'Chief Security Administrator',
-        '/assets/images/avatar_admin_portrait_1794911291825.jpg',
-        JSON.stringify(perms.map((p) => p[0])),
-        superAdminId,
-        now,
-      ],
-    );
-
-    // Delegated Admin
-    const verifierAdminRes = await executeSql(
-      `INSERT INTO user_accounts
-        (email, mobile, password_hash, role, is_active, is_mobile_verified, created_at, updated_at)
-       VALUES (?, ?, ?, 'ADMIN', 1, 1, ?, ?)`,
-      ['admin.verifier@secureqr.gov', '+15550100002', hashPassword('Verifier@2026!'), now, now],
-    );
-    const verifierAdminId = Number(verifierAdminRes.insertId);
-
-    await executeSql(
-      `INSERT INTO admin_profiles
-        (user_id, full_name, department, designation, avatar_url, permissions_json, created_by, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        verifierAdminId,
-        'Marcus Sterling',
-        'Identity Review Desk',
-        'Senior Verification Officer',
-        '/assets/images/avatar_admin_portrait_1794911291825.jpg',
-        JSON.stringify([
-          'can_view_registrations',
-          'can_approve_registrations',
-          'can_manage_qr',
-          'can_scan_qr',
-          'can_export_excel',
-        ]),
-        superAdminId,
-        now,
-      ],
-    );
-
-    // Sample User 1: APPROVED with Active 256-bit QR Code
-    const u1Res = await executeSql(
-      `INSERT INTO user_accounts
-        (email, mobile, password_hash, role, is_active, is_mobile_verified, created_at, updated_at)
-       VALUES (?, ?, ?, 'USER', 1, 1, ?, ?)`,
-      ['aarav.sharma@enterprise.org', '+15550101001', hashPassword('Member@2026!'), now, now],
-    );
-    const u1Id = Number(u1Res.insertId);
-    const u1CreatedAt = toMysqlDateTime(Date.now() - 86400000 * 5);
-    const u1RecRes = await executeSql(
-      `INSERT INTO user_records
-        (user_id, registration_id, full_name, dob, gender, address, city, district, state, country, postal_code,
-         profile_photo_url, id_proof_type, id_proof_url, dynamic_fields_json, consent_accepted, consent_timestamp,
-         approval_status, reviewed_by, reviewed_at, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 'APPROVED', ?, ?, ?, ?)`,
-      [
-        u1Id,
-        'SQR-2026-000101',
-        'Aarav Sharma',
-        '1993-04-18',
-        'Male',
-        '450 Mission Street, Suite 1200',
-        'San Francisco',
-        'San Francisco County',
-        'California',
-        'United States',
-        '94105',
-        '/assets/images/avatar_member_portrait_1794911275468.jpg',
-        'National Passport',
-        '/assets/images/brand_shield_emblem_1794911274112.jpg',
-        JSON.stringify({
-          organization: 'Pacific Cloud Infrastructure',
-          department: 'Platform Security',
-          access_tier: 'Executive Pass',
-          emergency_contact: '+15550199911',
-        }),
-        now,
-        superAdminId,
-        now,
-        u1CreatedAt,
-        now,
-      ],
-    );
-    const u1RecId = Number(u1RecRes.insertId);
-
-    await executeSql(
-      `INSERT INTO registration_requests
-        (user_record_id, request_type, status, notes, submitted_at, processed_by, processed_at)
-       VALUES (?, 'INITIAL', 'APPROVED', 'Identity and passport verified.', ?, ?, ?)`,
-      [u1RecId, u1CreatedAt, superAdminId, now],
-    );
-
-    const rawToken = generateSecureQrToken();
-    const tokenHash = sha256Hex(rawToken);
-    const tokenPrefix = tokenHash.slice(0, 12);
-    const verifyUrl = `${baseUrl.replace(/\/$/, '')}/verify?token=${encodeURIComponent(rawToken)}`;
-    const qrPngDataUrl = await QRCode.toDataURL(verifyUrl, {
-      errorCorrectionLevel: 'H',
-      margin: 2,
-      width: 420,
-      color: {dark: '#0F172A', light: '#FFFFFF'},
-    });
-    const expiresAt = toMysqlDateTime(Date.now() + 365 * 86400000);
-
-    const qrRes = await executeSql(
-      `INSERT INTO qr_codes
-        (user_record_id, token_hash, token_prefix, verification_url, qr_png_data_url, status, issued_at, expires_at, issued_by, last_verified_at, scan_count)
-       VALUES (?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?, ?, 2)`,
-      [u1RecId, tokenHash, tokenPrefix, verifyUrl, qrPngDataUrl, now, expiresAt, superAdminId, now],
-    );
-
-    await executeSql(
-      `INSERT INTO qr_scan_logs
-        (qr_code_id, user_record_id, scanned_by_admin_id, scanned_token_prefix, result_status, reason, ip_address, user_agent, scanned_at)
-       VALUES (?, ?, ?, ?, 'VALID', 'Active credential verified at main lobby.', '127.0.0.1', 'Seed/Verifier', ?)`,
-      [Number(qrRes.insertId), u1RecId, verifierAdminId, tokenPrefix, now],
-    );
-
-    // Sample User 2: PENDING
-    const u2Res = await executeSql(
-      `INSERT INTO user_accounts
-        (email, mobile, password_hash, role, is_active, is_mobile_verified, created_at, updated_at)
-       VALUES (?, ?, ?, 'USER', 1, 1, ?, ?)`,
-      ['priya.nair@meridianlabs.io', '+15550101002', hashPassword('Member@2026!'), now, now],
-    );
-    const u2Id = Number(u2Res.insertId);
-    const u2CreatedAt = toMysqlDateTime(Date.now() - 3600000 * 6);
-    const u2RecRes = await executeSql(
-      `INSERT INTO user_records
-        (user_id, registration_id, full_name, dob, gender, address, city, district, state, country, postal_code,
-         profile_photo_url, id_proof_type, id_proof_url, dynamic_fields_json, consent_accepted, consent_timestamp,
-         approval_status, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 'PENDING', ?, ?)`,
-      [
-        u2Id,
-        'SQR-2026-000102',
-        'Priya Nair',
-        '1995-09-12',
-        'Female',
-        '712 Congress Ave, Floor 8',
-        'Austin',
-        'Travis County',
-        'Texas',
-        'United States',
-        '78701',
-        '/assets/images/avatar_admin_portrait_1794911291825.jpg',
-        'Driver License',
-        '/assets/images/brand_shield_emblem_1794911274112.jpg',
-        JSON.stringify({
-          organization: 'Meridian BioSystems',
-          department: 'Clinical Research',
-          access_tier: 'Standard Member',
-          emergency_contact: '+15550199922',
-        }),
-        now,
-        u2CreatedAt,
-        now,
-      ],
-    );
-    const u2RecId = Number(u2RecRes.insertId);
-    await executeSql(
-      `INSERT INTO registration_requests
-        (user_record_id, request_type, status, notes, submitted_at)
-       VALUES (?, 'INITIAL', 'PENDING', 'Awaiting Admin review.', ?)`,
-      [u2RecId, u2CreatedAt],
-    );
-
-    // Sample User 3: PENDING
-    const u3Res = await executeSql(
-      `INSERT INTO user_accounts
-        (email, mobile, password_hash, role, is_active, is_mobile_verified, created_at, updated_at)
-       VALUES (?, ?, ?, 'USER', 1, 1, ?, ?)`,
-      ['daniel.chen@northstar.co', '+15550101003', hashPassword('Member@2026!'), now, now],
-    );
-    const u3Id = Number(u3Res.insertId);
-    const u3CreatedAt = toMysqlDateTime(Date.now() - 3600000 * 2);
-    const u3RecRes = await executeSql(
-      `INSERT INTO user_records
-        (user_id, registration_id, full_name, dob, gender, address, city, district, state, country, postal_code,
-         profile_photo_url, id_proof_type, id_proof_url, dynamic_fields_json, consent_accepted, consent_timestamp,
-         approval_status, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 'PENDING', ?, ?)`,
-      [
-        u3Id,
-        'SQR-2026-000103',
-        'Daniel Chen',
-        '1990-11-03',
-        'Male',
-        '200 Clarendon St',
-        'Boston',
-        'Suffolk County',
-        'Massachusetts',
-        'United States',
-        '02116',
-        '/assets/images/avatar_member_portrait_1794911275468.jpg',
-        'State ID',
-        '/assets/images/brand_shield_emblem_1794911274112.jpg',
-        JSON.stringify({
-          organization: 'Northstar Logistics',
-          department: 'Field Operations',
-          access_tier: 'Facility Contractor',
-          emergency_contact: '+15550199933',
-        }),
-        now,
-        u3CreatedAt,
-        now,
-      ],
-    );
-    const u3RecId = Number(u3RecRes.insertId);
-    await executeSql(
-      `INSERT INTO registration_requests
-        (user_record_id, request_type, status, notes, submitted_at)
-       VALUES (?, 'INITIAL', 'PENDING', 'Awaiting Admin review.', ?)`,
-      [u3RecId, u3CreatedAt],
-    );
-
-    // Sample User 4: RESUBMISSION_REQUIRED
-    const u4Res = await executeSql(
-      `INSERT INTO user_accounts
-        (email, mobile, password_hash, role, is_active, is_mobile_verified, created_at, updated_at)
-       VALUES (?, ?, ?, 'USER', 1, 1, ?, ?)`,
-      ['sofia.rodriguez@civicgrid.org', '+15550101004', hashPassword('Member@2026!'), now, now],
-    );
-    const u4Id = Number(u4Res.insertId);
-    const u4CreatedAt = toMysqlDateTime(Date.now() - 86400000 * 2);
-    const u4RecRes = await executeSql(
-      `INSERT INTO user_records
-        (user_id, registration_id, full_name, dob, gender, address, city, district, state, country, postal_code,
-         profile_photo_url, id_proof_type, id_proof_url, dynamic_fields_json, consent_accepted, consent_timestamp,
-         approval_status, resubmission_note, reviewed_by, reviewed_at, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 'RESUBMISSION_REQUIRED', ?, ?, ?, ?, ?)`,
-      [
-        u4Id,
-        'SQR-2026-000104',
-        'Sofia Rodriguez',
-        '1992-07-29',
-        'Female',
-        '88 Colin P Kelly Jr St',
-        'San Jose',
-        'Santa Clara County',
-        'California',
-        'United States',
-        '95113',
-        '/assets/images/avatar_admin_portrait_1794911291825.jpg',
-        'National Passport',
-        '/assets/images/brand_shield_emblem_1794911274112.jpg',
-        JSON.stringify({
-          organization: 'CivicGrid Energy',
-          department: 'Grid Telemetry',
-          access_tier: 'Facility Contractor',
-          emergency_contact: '+15550199944',
-        }),
-        now,
-        'Please update street address with suite number and re-upload a clear ID proof image.',
-        verifierAdminId,
-        now,
-        u4CreatedAt,
-        now,
-      ],
-    );
-    const u4RecId = Number(u4RecRes.insertId);
-    await executeSql(
-      `INSERT INTO registration_requests
-        (user_record_id, request_type, status, notes, submitted_at, processed_by, processed_at)
-       VALUES (?, 'INITIAL', 'RESUBMISSION_REQUIRED', 'Address clarification requested.', ?, ?, ?)`,
-      [u4RecId, u4CreatedAt, verifierAdminId, now],
-    );
-
-    // Sample User 5: REJECTED
-    const u5Res = await executeSql(
-      `INSERT INTO user_accounts
-        (email, mobile, password_hash, role, is_active, is_mobile_verified, created_at, updated_at)
-       VALUES (?, ?, ?, 'USER', 1, 1, ?, ?)`,
-      ['liam.okafor@example.net', '+15550101005', hashPassword('Member@2026!'), now, now],
-    );
-    const u5Id = Number(u5Res.insertId);
-    const u5CreatedAt = toMysqlDateTime(Date.now() - 86400000 * 3);
-    const u5RecRes = await executeSql(
-      `INSERT INTO user_records
-        (user_id, registration_id, full_name, dob, gender, address, city, district, state, country, postal_code,
-         profile_photo_url, id_proof_type, id_proof_url, dynamic_fields_json, consent_accepted, consent_timestamp,
-         approval_status, rejection_reason, reviewed_by, reviewed_at, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 'REJECTED', ?, ?, ?, ?, ?)`,
-      [
-        u5Id,
-        'SQR-2026-000105',
-        'Liam Okafor',
-        '1988-02-14',
-        'Male',
-        '1400 Brickell Ave',
-        'Miami',
-        'Miami-Dade County',
-        'Florida',
-        'United States',
-        '33131',
-        '/assets/images/avatar_member_portrait_1794911275468.jpg',
-        'National ID',
-        '/assets/images/brand_shield_emblem_1794911274112.jpg',
-        JSON.stringify({
-          organization: 'Independent Contractor',
-          department: 'External',
-          access_tier: 'Visitor Escort',
-          emergency_contact: '+15550199955',
-        }),
-        now,
-        'Submitted government identification expired prior to application date.',
-        superAdminId,
-        now,
-        u5CreatedAt,
-        now,
-      ],
-    );
-    const u5RecId = Number(u5RecRes.insertId);
-    await executeSql(
-      `INSERT INTO registration_requests
-        (user_record_id, request_type, status, notes, submitted_at, processed_by, processed_at)
-       VALUES (?, 'INITIAL', 'REJECTED', 'Expired ID document.', ?, ?, ?)`,
-      [u5RecId, u5CreatedAt, superAdminId, now],
-    );
-
-    // Notifications
-    const notifSql = `INSERT INTO notifications
-      (recipient_user_id, recipient_role, type, title, message, link_path, metadata_json, is_read, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)`;
-
-    await executeSql(notifSql, [
-      null,
-      'ADMIN',
-      'NEW_REGISTRATION',
-      'New Registration Pending Review',
-      'Priya Nair (SQR-2026-000102) submitted an application from Austin, Texas.',
-      '/admin/registrations',
-      JSON.stringify({userRecordId: u2RecId, registrationId: 'SQR-2026-000102'}),
-      now,
-    ]);
-    await executeSql(notifSql, [
-      null,
-      'ADMIN',
-      'NEW_REGISTRATION',
-      'New Registration Pending Review',
-      'Daniel Chen (SQR-2026-000103) submitted an application from Boston, Massachusetts.',
-      '/admin/registrations',
-      JSON.stringify({userRecordId: u3RecId, registrationId: 'SQR-2026-000103'}),
-      now,
-    ]);
-    await executeSql(notifSql, [
-      u1Id,
-      null,
-      'QR_GENERATED',
-      'Credential Approved & QR Ready',
-      'Your application (SQR-2026-000101) was approved and your active QR credential is ready.',
-      '/user/qr-card',
-      JSON.stringify({registrationId: 'SQR-2026-000101'}),
-      now,
-    ]);
-    await executeSql(notifSql, [
-      u4Id,
-      null,
-      'RESUBMISSION_REQUIRED',
-      'Resubmission Requested',
-      'Please update street address with suite number and re-upload a clear ID proof image.',
-      '/user/profile',
-      JSON.stringify({registrationId: 'SQR-2026-000104'}),
-      now,
-    ]);
-    await executeSql(notifSql, [
-      u5Id,
-      null,
-      'REGISTRATION_REJECTED',
-      'Application Rejected',
-      'Submitted government identification expired prior to application date.',
-      '/user/home',
-      JSON.stringify({registrationId: 'SQR-2026-000105'}),
-      now,
-    ]);
-
-    // Initial Audit Log
-    await executeSql(
-      `INSERT INTO admin_activity_logs
-        (actor_user_id, actor_email, actor_role, action, target_type, target_id, details_json, ip_address, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        superAdminId,
-        'superadmin@secureqr.gov',
-        'SUPER_ADMIN',
-        'SYSTEM_INITIALIZED',
-        'SYSTEM',
-        'bootstrap',
-        JSON.stringify({seededUsers: 5, seededAdmins: 2}),
-        '127.0.0.1',
-        now,
-      ],
-    );
-
+    // Always ensure only the fixed Super Admin exists (no fake sample users or dummy admins)
     await ensureFixedAdmin();
     seeded = true;
   })().catch((err) => {

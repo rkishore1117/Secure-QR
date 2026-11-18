@@ -15,6 +15,16 @@ export class ApiService {
   private readonly http = inject(HttpClient);
 
   // Public
+  getPublicHealth() {
+    return this.http.get<{
+      databaseConnected: boolean;
+      databaseEngine: string;
+      databaseName: string;
+      emailConfigured: boolean;
+      emailProvider: string;
+    }>('/api/v1/public/health');
+  }
+
   getPublicFieldConfigs() {
     return this.http.get<{
       organizationName: string;
@@ -140,6 +150,13 @@ export class ApiService {
       total: number;
       page: number;
       pageSize: number;
+      counts?: {
+        all: number;
+        pending: number;
+        approved: number;
+        resubmission: number;
+        rejected: number;
+      };
       filters: {states: string[]; cities: string[]};
     }>('/api/v1/admin/registrations', {params});
   }
