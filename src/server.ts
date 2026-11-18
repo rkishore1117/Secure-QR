@@ -7,7 +7,7 @@ import {
 import express from 'express';
 import {createServer} from 'node:http';
 import {join} from 'node:path';
-import {ensureSeeded} from './server/db';
+import {ensureSeeded, getEnvValue} from './server/db';
 import {startDailyReportScheduler} from './server/mailer';
 import {createApiRouter} from './server/routes';
 import {notificationHub} from './server/ws';
@@ -24,11 +24,7 @@ const app = express();
 const angularApp = new AngularNodeAppEngine();
 
 // Initialize dedicated MySQL RDS schema, seed fixed Super Admin & start 24h Excel email scheduler
-void ensureSeeded(
-  process.env['APP_URL'] && process.env['APP_URL'] !== 'MY_APP_URL'
-    ? process.env['APP_URL']
-    : 'http://localhost:3000',
-)
+void ensureSeeded(getEnvValue('APP_URL') || 'http://localhost:3000')
   .then(() => startDailyReportScheduler())
   .catch((err) => {
     console.error('[MYSQL RDS STARTUP ERROR]', err instanceof Error ? err.message : err);

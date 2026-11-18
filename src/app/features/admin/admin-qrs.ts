@@ -85,14 +85,24 @@ export class AdminQrs implements OnInit {
   }
 
   async load(): Promise<void> {
-    const res = await firstValueFrom(this.api.getAdminQrs());
-    this.qrs.set(res.qrs);
+    try {
+      const res = await firstValueFrom(this.api.getAdminQrs());
+      this.qrs.set(res.qrs);
+    } catch (err: unknown) {
+      const msg = (err as {error?: {error?: string}})?.error?.error || 'Could not load QR credentials.';
+      this.toast.error('Load Failed', msg);
+    }
   }
 
   async revoke(qrId: number): Promise<void> {
-    await firstValueFrom(this.api.revokeQr(qrId, 'Revoked via QR Management console'));
-    this.toast.info('QR Revoked', 'Credential marked REVOKED immediately.');
-    await this.load();
+    try {
+      await firstValueFrom(this.api.revokeQr(qrId, 'Revoked via QR Management console'));
+      this.toast.info('QR Revoked', 'Credential marked REVOKED immediately.');
+      await this.load();
+    } catch (err: unknown) {
+      const msg = (err as {error?: {error?: string}})?.error?.error || 'Could not revoke QR credential.';
+      this.toast.error('Error', msg);
+    }
   }
 
   async regenerate(qrId: number): Promise<void> {

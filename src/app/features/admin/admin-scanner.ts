@@ -247,8 +247,12 @@ export class AdminScanner implements OnInit, OnDestroy {
   }
 
   async loadScanLogs(): Promise<void> {
-    const res = await firstValueFrom(this.api.getAdminScanLogs());
-    this.scanLogs.set(res.logs);
+    try {
+      const res = await firstValueFrom(this.api.getAdminScanLogs());
+      this.scanLogs.set(res.logs);
+    } catch {
+      this.toast.error('Log Error', 'Unable to load recent verification logs.');
+    }
   }
 
   async startCamera(): Promise<void> {
@@ -317,7 +321,8 @@ export class AdminScanner implements OnInit, OnDestroy {
   }
 
   decodeQrFile(event: Event): void {
-    const file = (event.target as HTMLInputElement).files?.[0];
+    const input = event.target as HTMLInputElement;
+    const file = input.files?.[0];
     if (!file) return;
     const img = new Image();
     const url = URL.createObjectURL(file);
@@ -326,16 +331,26 @@ export class AdminScanner implements OnInit, OnDestroy {
       canvas.width = img.width;
       canvas.height = img.height;
       const ctx = canvas.getContext('2d');
-      if (!ctx) return;
+      if (!ctx) {
+        URL.revokeObjectURL(url);
+        input.value = '';
+        return;
+      }
       ctx.drawImage(img, 0, 0);
       const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
       const decoded = jsQR(imageData.data, canvas.width, canvas.height);
       URL.revokeObjectURL(url);
+      input.value = '';
       if (decoded?.data) {
         void this.verifyPayload(decoded.data);
       } else {
         this.toast.error('Decode Failed', 'No valid QR matrix detected in the uploaded image.');
       }
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      input.value = '';
+      this.toast.error('Invalid Image', 'Could not read the selected image file.');
     };
     img.src = url;
   }

@@ -1,11 +1,26 @@
 import crypto from 'node:crypto';
 
-const JWT_SECRET =
-  process.env['JWT_SECRET'] ||
-  'dev-secure-qr-verification-secret-change-in-production-256bit';
-const OTP_PEPPER =
-  process.env['OTP_PEPPER'] ||
-  'dev-secure-qr-otp-pepper-change-in-production';
+function readNonPlaceholderSecret(key: string, fallback: string): string {
+  const val = (process.env[key] || '').trim();
+  if (!val || /^(replace[-_]with|your[-_]|changeme$|example$|MY_)/i.test(val)) {
+    return fallback;
+  }
+  return val;
+}
+
+function getJwtSecret(): string {
+  return readNonPlaceholderSecret(
+    'JWT_SECRET',
+    'dev-secure-qr-verification-secret-change-in-production-256bit',
+  );
+}
+
+function getOtpPepper(): string {
+  return readNonPlaceholderSecret(
+    'OTP_PEPPER',
+    'dev-secure-qr-otp-pepper-change-in-production',
+  );
+}
 
 export interface AccessTokenPayload {
   sub: number;
@@ -40,7 +55,7 @@ export function sha256Hex(value: string): string {
 
 export function hashOtp(mobile: string, otp: string): string {
   return crypto
-    .createHmac('sha256', OTP_PEPPER)
+    .createHmac('sha256', getOtpPepper())
     .update(`${mobile}:${otp}`, 'utf8')
     .digest('hex');
 }
@@ -77,7 +92,7 @@ export function signAccessToken(
   };
   const body = base64UrlEncode(JSON.stringify(bodyObj));
   const signature = crypto
-    .createHmac('sha256', JWT_SECRET)
+    .createHmac('sha256', getJwtSecret())
     .update(`${header}.${body}`)
     .digest('base64url');
   return `${header}.${body}.${signature}`;
@@ -90,7 +105,7 @@ export function verifyAccessToken(token: string): AccessTokenPayload | null {
   if (!header || !body || !sig) return null;
 
   const expectedSig = crypto
-    .createHmac('sha256', JWT_SECRET)
+    .createHmac('sha256', getJwtSecret())
     .update(`${header}.${body}`)
     .digest('base64url');
 

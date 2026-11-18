@@ -1,4 +1,4 @@
-import {ChangeDetectionStrategy, Component, OnInit, inject, signal} from '@angular/core';
+import {ChangeDetectionStrategy, Component, OnDestroy, OnInit, inject, signal} from '@angular/core';
 import {FormBuilder, ReactiveFormsModule, Validators} from '@angular/forms';
 import {ActivatedRoute, RouterLink} from '@angular/router';
 import {MatIconModule} from '@angular/material/icon';
@@ -253,11 +253,13 @@ import {ToastService} from '../../core/services/toast.service';
     </div>
   `,
 })
-export class ForgotPassword implements OnInit {
+export class ForgotPassword implements OnInit, OnDestroy {
   private readonly fb = inject(FormBuilder);
   private readonly api = inject(ApiService);
   private readonly route = inject(ActivatedRoute);
   private readonly toast = inject(ToastService);
+
+  private cooldownTimer: ReturnType<typeof setInterval> | null = null;
 
   protected readonly portalMode = signal<'USER' | 'ADMIN'>('USER');
   protected readonly step = signal<1 | 2 | 3>(1);
@@ -298,6 +300,13 @@ export class ForgotPassword implements OnInit {
     const emailParam = String(this.route.snapshot.queryParams['email'] || '').trim();
     if (emailParam) {
       this.emailForm.patchValue({email: emailParam});
+    }
+  }
+
+  ngOnDestroy(): void {
+    if (this.cooldownTimer) {
+      clearInterval(this.cooldownTimer);
+      this.cooldownTimer = null;
     }
   }
 
@@ -353,6 +362,9 @@ export class ForgotPassword implements OnInit {
 
   backToEmail(): void {
     this.errorMsg.set(null);
+    this.otpForm.reset();
+    this.devOtpHint.set(null);
+    this.emailNotice.set(null);
     this.step.set(1);
   }
 
@@ -416,11 +428,18 @@ export class ForgotPassword implements OnInit {
   }
 
   private startCooldown(seconds: number): void {
+    if (this.cooldownTimer) {
+      clearInterval(this.cooldownTimer);
+      this.cooldownTimer = null;
+    }
     this.resendCooldown.set(seconds);
-    const timer = setInterval(() => {
+    this.cooldownTimer = setInterval(() => {
       const next = this.resendCooldown() - 1;
       this.resendCooldown.set(Math.max(0, next));
-      if (next <= 0) clearInterval(timer);
+      if (next <= 0 && this.cooldownTimer) {
+        clearInterval(this.cooldownTimer);
+        this.cooldownTimer = null;
+      }
     }, 1000);
   }
 }

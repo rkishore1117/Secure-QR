@@ -25,6 +25,18 @@ import {StatusText} from '../../shared/components/status-text';
           <div class="h-5 w-48 rounded bg-slate-200"></div>
           <div class="h-4 w-72 rounded bg-slate-100"></div>
         </div>
+      } @else if (errorMsg()) {
+        <div class="rounded-xl border border-red-200 bg-red-50 p-6 space-y-3">
+          <p class="text-sm font-semibold text-red-900">{{ errorMsg() }}</p>
+          <button
+            type="button"
+            (click)="loadDashboard()"
+            class="touch-target inline-flex items-center gap-2 rounded-lg bg-[#0F172A] px-4 py-2 text-xs font-semibold text-white hover:bg-[#1E3A5F]"
+          >
+            <mat-icon class="text-[16px]!">refresh</mat-icon>
+            <span>Retry</span>
+          </button>
+        </div>
       } @else if (record(); as rec) {
         <!-- Exact Status Banner -->
         <div
@@ -157,6 +169,7 @@ export class UserHome implements OnInit {
   private readonly api = inject(ApiService);
 
   protected readonly loading = signal(true);
+  protected readonly errorMsg = signal<string | null>(null);
   protected readonly record = signal<UserRecord | null>(null);
   protected readonly activeQr = signal<QRCodeItem | null>(null);
   protected readonly recentNotifications = signal<NotificationItem[]>([]);
@@ -164,13 +177,22 @@ export class UserHome implements OnInit {
     {id: number; request_type: string; status: string; notes: string; submitted_at: string; processed_at: string | null}[]
   >([]);
 
-  async ngOnInit(): Promise<void> {
+  ngOnInit(): void {
+    void this.loadDashboard();
+  }
+
+  async loadDashboard(): Promise<void> {
+    this.loading.set(true);
+    this.errorMsg.set(null);
     try {
       const res = await firstValueFrom(this.api.getUserDashboard());
       this.record.set(res.record);
       this.activeQr.set(res.activeQr);
       this.recentNotifications.set(res.recentNotifications);
       this.history.set(res.history);
+    } catch (err: unknown) {
+      const msg = (err as {error?: {error?: string}})?.error?.error || 'Could not load your dashboard right now.';
+      this.errorMsg.set(msg);
     } finally {
       this.loading.set(false);
     }

@@ -4,6 +4,7 @@ import {FormBuilder, ReactiveFormsModule} from '@angular/forms';
 import {MatIconModule} from '@angular/material/icon';
 import {firstValueFrom} from 'rxjs';
 import {ApiService} from '../../core/services/api.service';
+import {ToastService} from '../../core/services/toast.service';
 
 @Component({
   selector: 'app-admin-audit-logs',
@@ -72,6 +73,7 @@ import {ApiService} from '../../core/services/api.service';
 export class AdminAuditLogs implements OnInit {
   private readonly fb = inject(FormBuilder);
   private readonly api = inject(ApiService);
+  private readonly toast = inject(ToastService);
 
   protected readonly logs = signal<Record<string, unknown>[]>([]);
   protected readonly form = this.fb.group({search: ['']});
@@ -81,7 +83,12 @@ export class AdminAuditLogs implements OnInit {
   }
 
   async load(): Promise<void> {
-    const res = await firstValueFrom(this.api.getAuditLogs('', this.form.value.search || ''));
-    this.logs.set(res.logs);
+    try {
+      const res = await firstValueFrom(this.api.getAuditLogs('', this.form.value.search || ''));
+      this.logs.set(res.logs);
+    } catch (err: unknown) {
+      const msg = (err as {error?: {error?: string}})?.error?.error || 'Could not load audit logs.';
+      this.toast.error('Load Failed', msg);
+    }
   }
 }

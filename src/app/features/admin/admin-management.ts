@@ -168,9 +168,14 @@ export class AdminManagement implements OnInit {
   }
 
   async load(): Promise<void> {
-    const res = await firstValueFrom(this.api.getAdmins());
-    this.admins.set(res.admins);
-    this.availablePermissions.set(res.availablePermissions);
+    try {
+      const res = await firstValueFrom(this.api.getAdmins());
+      this.admins.set(res.admins);
+      this.availablePermissions.set(res.availablePermissions);
+    } catch (err: unknown) {
+      const msg = (err as {error?: {error?: string}})?.error?.error || 'Could not load admin accounts.';
+      this.toast.error('Load Failed', msg);
+    }
   }
 
   toggleCreatePerm(code: string): void {
@@ -189,15 +194,25 @@ export class AdminManagement implements OnInit {
     const updated = current.includes(code)
       ? current.filter((c) => c !== code)
       : [...current, code];
-    await firstValueFrom(this.api.updateAdmin(Number(adm['id']), {permissions: updated}));
-    this.toast.success('Permissions Updated', `Updated permissions for ${adm['full_name']}.`);
-    await this.load();
+    try {
+      await firstValueFrom(this.api.updateAdmin(Number(adm['id']), {permissions: updated}));
+      this.toast.success('Permissions Updated', `Updated permissions for ${adm['full_name']}.`);
+      await this.load();
+    } catch (err: unknown) {
+      const msg = (err as {error?: {error?: string}})?.error?.error || 'Could not update permissions.';
+      this.toast.error('Error', msg);
+    }
   }
 
   async toggleActive(id: number, isActive: boolean): Promise<void> {
-    await firstValueFrom(this.api.updateAdmin(id, {isActive}));
-    this.toast.info('Admin Status Updated', `Admin account ${isActive ? 'activated' : 'deactivated'}.`);
-    await this.load();
+    try {
+      await firstValueFrom(this.api.updateAdmin(id, {isActive}));
+      this.toast.info('Admin Status Updated', `Admin account ${isActive ? 'activated' : 'deactivated'}.`);
+      await this.load();
+    } catch (err: unknown) {
+      const msg = (err as {error?: {error?: string}})?.error?.error || 'Could not update admin status.';
+      this.toast.error('Error', msg);
+    }
   }
 
   async createAdmin(): Promise<void> {

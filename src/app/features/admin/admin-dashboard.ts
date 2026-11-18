@@ -39,6 +39,26 @@ import {StatusText} from '../../shared/components/status-text';
         </div>
       </div>
 
+      @if (loading()) {
+        <div class="grid grid-cols-2 gap-3 sm:grid-cols-2 md:grid-cols-4">
+          @for (_ of [1, 2, 3, 4]; track $index) {
+            <div class="h-24 rounded-xl border border-slate-200 bg-white animate-pulse"></div>
+          }
+        </div>
+      } @else if (errorMsg()) {
+        <div class="rounded-xl border border-red-200 bg-red-50 p-5 flex flex-wrap items-center justify-between gap-3">
+          <p class="text-sm font-semibold text-red-900">{{ errorMsg() }}</p>
+          <button
+            type="button"
+            (click)="loadDashboard()"
+            class="touch-target inline-flex items-center gap-2 rounded-lg bg-[#0F172A] px-4 py-2 text-xs font-semibold text-white hover:bg-[#1E3A5F]"
+          >
+            <mat-icon class="text-[16px]!">refresh</mat-icon>
+            <span>Retry</span>
+          </button>
+        </div>
+      }
+
       @if (stats(); as s) {
         <!-- 8 Required KPI Cards -->
         <div class="grid grid-cols-2 gap-3 sm:grid-cols-2 md:grid-cols-4">
@@ -143,14 +163,29 @@ import {StatusText} from '../../shared/components/status-text';
 export class AdminDashboard implements OnInit {
   private readonly api = inject(ApiService);
 
+  protected readonly loading = signal(true);
+  protected readonly errorMsg = signal<string | null>(null);
   protected readonly stats = signal<DashboardStats | null>(null);
   protected readonly recentRegistrations = signal<UserRecord[]>([]);
   protected readonly recentScans = signal<Record<string, unknown>[]>([]);
 
-  async ngOnInit(): Promise<void> {
-    const res = await firstValueFrom(this.api.getAdminDashboardStats());
-    this.stats.set(res.stats);
-    this.recentRegistrations.set(res.recentRegistrations);
-    this.recentScans.set(res.recentScans);
+  ngOnInit(): void {
+    void this.loadDashboard();
+  }
+
+  async loadDashboard(): Promise<void> {
+    this.loading.set(true);
+    this.errorMsg.set(null);
+    try {
+      const res = await firstValueFrom(this.api.getAdminDashboardStats());
+      this.stats.set(res.stats);
+      this.recentRegistrations.set(res.recentRegistrations);
+      this.recentScans.set(res.recentScans);
+    } catch (err: unknown) {
+      const msg = (err as {error?: {error?: string}})?.error?.error || 'Could not load dashboard metrics.';
+      this.errorMsg.set(msg);
+    } finally {
+      this.loading.set(false);
+    }
   }
 }

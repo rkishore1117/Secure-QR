@@ -92,9 +92,9 @@ import {ToastService} from '../../core/services/toast.service';
             <p class="mt-1 font-semibold text-[#0F172A] tabular-nums">Every {{ scheduleHours() }} Hours</p>
           </div>
           <div>
-            <p class="text-slate-500 font-medium">SMTP Gateway</p>
+            <p class="text-slate-500 font-medium">Email Delivery Gateway</p>
             <p class="mt-1 font-semibold" [class.text-emerald-700]="smtpConfigured()" [class.text-amber-700]="!smtpConfigured()">
-              {{ smtpConfigured() ? 'Configured (Gmail TLS)' : 'Not Configured' }}
+              {{ deliveryModeLabel() }}
             </p>
           </div>
         </div>
@@ -184,6 +184,7 @@ export class AdminExport implements OnInit {
   protected readonly recipientEmail = signal('kishore.sathayush@gmail.com');
   protected readonly scheduleHours = signal(24);
   protected readonly smtpConfigured = signal(false);
+  protected readonly emailDeliveryMode = signal('console');
 
   protected readonly form = this.fb.group({
     status: ['ALL'],
@@ -198,9 +199,29 @@ export class AdminExport implements OnInit {
     void this.loadScheduledLogs();
   }
 
+  deliveryModeLabel(): string {
+    if (!this.smtpConfigured()) return 'Not Configured';
+    switch (this.emailDeliveryMode()) {
+      case 'https-webhook':
+        return 'Configured (Apps Script HTTPS Relay)';
+      case 'brevo-https':
+        return 'Configured (Brevo HTTPS API)';
+      case 'resend-https':
+        return 'Configured (Resend HTTPS API)';
+      case 'gmail-smtp':
+        return 'Configured (Gmail SMTP TLS)';
+      default:
+        return 'Configured';
+    }
+  }
+
   async loadHistory(): Promise<void> {
-    const res = await firstValueFrom(this.api.getExportHistory());
-    this.history.set(res.history);
+    try {
+      const res = await firstValueFrom(this.api.getExportHistory());
+      this.history.set(res.history);
+    } catch {
+      this.toast.error('Load Failed', 'Could not load Excel export history.');
+    }
   }
 
   async loadScheduledLogs(): Promise<void> {
@@ -209,6 +230,7 @@ export class AdminExport implements OnInit {
       this.recipientEmail.set(res.recipientEmail);
       this.scheduleHours.set(res.scheduleIntervalHours);
       this.smtpConfigured.set(res.smtpConfigured);
+      this.emailDeliveryMode.set(res.emailDeliveryMode || 'console');
       this.scheduledLogs.set(res.logs);
     } catch {
       // ignore if endpoint temporarily unavailable

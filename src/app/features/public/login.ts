@@ -89,7 +89,7 @@ import {ToastService} from '../../core/services/toast.service';
                 </label>
                 <a
                   routerLink="/forgot-password"
-                  [queryParams]="{portal: portalMode()}"
+                  [queryParams]="forgotQueryParams(portalMode())"
                   class="text-xs font-semibold text-[#1E3A5F] hover:underline"
                 >
                   Forgot Password?
@@ -135,7 +135,7 @@ import {ToastService} from '../../core/services/toast.service';
                 Forgotten or rotated admin password? Use
                 <a
                   routerLink="/forgot-password"
-                  [queryParams]="{portal: 'ADMIN'}"
+                  [queryParams]="forgotQueryParams('ADMIN')"
                   class="font-semibold text-[#1E3A5F] hover:underline"
                 >
                   Forgot Password
@@ -175,6 +175,11 @@ export class Login implements OnInit {
   switchMode(mode: 'USER' | 'ADMIN'): void {
     this.portalMode.set(mode);
     this.errorMsg.set(null);
+  }
+
+  forgotQueryParams(portal: 'USER' | 'ADMIN'): Record<string, string> {
+    const id = String(this.form.value.identifier || '').trim();
+    return id.includes('@') ? {portal, email: id} : {portal};
   }
 
   async submit(): Promise<void> {

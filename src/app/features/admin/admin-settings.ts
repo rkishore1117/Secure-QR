@@ -85,13 +85,33 @@ import {ToastService} from '../../core/services/toast.service';
               <option value="select">Select Dropdown</option>
             </select>
           </div>
-          <button
-            type="submit"
-            class="touch-target inline-flex items-center justify-center gap-1.5 rounded-lg bg-[#1E3A5F] px-4 py-2 text-xs font-semibold text-white hover:bg-[#0F172A]"
-          >
-            <mat-icon class="text-[18px]!">add</mat-icon>
-            <span>Add Field</span>
-          </button>
+          <div class="flex items-center justify-between gap-3">
+            <label class="inline-flex items-center gap-2 text-xs font-medium text-slate-700 cursor-pointer">
+              <input type="checkbox" formControlName="isRequired" class="h-4 w-4 rounded border-slate-300" />
+              <span>Required</span>
+            </label>
+            <button
+              type="submit"
+              class="touch-target inline-flex items-center justify-center gap-1.5 rounded-lg bg-[#1E3A5F] px-4 py-2 text-xs font-semibold text-white hover:bg-[#0F172A] whitespace-nowrap"
+            >
+              <mat-icon class="text-[18px]!">add</mat-icon>
+              <span>Add Field</span>
+            </button>
+          </div>
+          @if (fieldForm.value.fieldType === 'select') {
+            <div class="sm:col-span-4">
+              <label for="df-options" class="block text-xs font-semibold text-slate-700 mb-1">
+                Dropdown Options (comma-separated)
+              </label>
+              <input
+                id="df-options"
+                type="text"
+                formControlName="optionsText"
+                placeholder="e.g., Zone A, Zone B, All Access"
+                class="w-full h-10 rounded-lg border border-slate-300 px-3 text-xs"
+              />
+            </div>
+          }
         </form>
 
         <div class="divide-y divide-slate-100 border-t border-slate-200 pt-2">
@@ -166,10 +186,12 @@ import {ToastService} from '../../core/services/toast.service';
             </div>
 
             <div class="rounded-lg border border-slate-200 bg-slate-50 p-4 text-xs space-y-1">
-              <p class="font-semibold text-[#0F172A]">Email OTP Verification (Gmail SMTP)</p>
-              <p class="font-mono text-slate-600 break-all">Sender: {{ status.integrations.smtpUser || 'Not Set' }} · {{ status.integrations.smtpHost }}</p>
+              <p class="font-semibold text-[#0F172A]">Email OTP Verification</p>
+              <p class="font-mono text-slate-600 break-all">
+                Sender: {{ status.integrations.smtpUser || 'Not Set' }} · Mode: {{ status.integrations.emailDeliveryMode || status.integrations.smtpHost }}
+              </p>
               <p [class.text-emerald-700]="status.integrations.emailOtpConfigured" [class.text-slate-600]="!status.integrations.emailOtpConfigured" class="font-semibold">
-                {{ status.integrations.emailOtpConfigured ? 'Active (Registration OTP Emails Enabled)' : 'SMTP Credentials Missing' }}
+                {{ status.integrations.emailOtpConfigured ? 'Active (Registration OTP Emails Enabled)' : 'Email Credentials Missing' }}
               </p>
             </div>
 
@@ -194,11 +216,12 @@ export class AdminSettings implements OnInit {
   protected readonly initializingDb = signal(false);
   protected readonly integrationStatus = signal<{
     database: {configured: boolean; connected: boolean; host: string; database: string; activeEngine: string; error?: string};
-    integrations: {
-      smtpConfigured: boolean;
-      emailOtpConfigured: boolean;
-      smtpHost: string;
-      smtpUser: string;
+      integrations: {
+        smtpConfigured: boolean;
+        emailOtpConfigured: boolean;
+        emailDeliveryMode?: string;
+        smtpHost: string;
+        smtpUser: string;
       dailyReportRecipient: string;
       s3Configured: boolean;
       s3Bucket: string;
@@ -221,6 +244,8 @@ export class AdminSettings implements OnInit {
     fieldKey: ['', Validators.required],
     label: ['', Validators.required],
     fieldType: ['text'],
+    isRequired: [false],
+    optionsText: [''],
   });
 
   ngOnInit(): void {
@@ -228,14 +253,19 @@ export class AdminSettings implements OnInit {
   }
 
   async load(): Promise<void> {
-    const res = await firstValueFrom(this.api.getSystemSettings());
-    this.settingsForm.patchValue(res.settings);
-    this.fieldConfigs.set(res.fieldConfigs);
     try {
-      const status = await firstValueFrom(this.api.getIntegrationStatus());
-      this.integrationStatus.set(status);
-    } catch {
-      // optional integration status check
+      const res = await firstValueFrom(this.api.getSystemSettings());
+      this.settingsForm.patchValue(res.settings);
+      this.fieldConfigs.set(res.fieldConfigs);
+      try {
+        const status = await firstValueFrom(this.api.getIntegrationStatus());
+        this.integrationStatus.set(status);
+      } catch {
+        // optional integration status check
+      }
+    } catch (err: unknown) {
+      const msg = (err as {error?: {error?: string}})?.error?.error || 'Could not load system settings.';
+      this.toast.error('Load Failed', msg);
     }
   }
 
@@ -249,46 +279,84 @@ export class AdminSettings implements OnInit {
         this.toast.error('RDS Unreachable', res.error || res.message);
       }
       await this.load();
+    } catch (err: unknown) {
+      const msg = (err as {error?: {error?: string}})?.error?.error || 'Database check failed.';
+      this.toast.error('Error', msg);
     } finally {
       this.initializingDb.set(false);
     }
   }
 
   async saveSettings(): Promise<void> {
-    const raw = this.settingsForm.value as Record<string, string>;
-    await firstValueFrom(this.api.updateSystemSettings(raw));
-    this.toast.success('Settings Saved', 'System configuration updated.');
+    try {
+      const raw = this.settingsForm.value as Record<string, string>;
+      await firstValueFrom(this.api.updateSystemSettings(raw));
+      this.toast.success('Settings Saved', 'System configuration updated.');
+    } catch (err: unknown) {
+      const msg = (err as {error?: {error?: string}})?.error?.error || 'Could not save settings.';
+      this.toast.error('Error', msg);
+    }
   }
 
   async addField(): Promise<void> {
     if (this.fieldForm.invalid) return;
-    await firstValueFrom(
-      this.api.addFieldConfig({
-        ...this.fieldForm.value,
-        isRequired: false,
-        isEnabled: true,
-        isEditableOnResubmit: true,
-      }),
-    );
-    this.fieldForm.reset({fieldType: 'text'});
-    this.toast.success('Field Added', 'Dynamic registration field enabled.');
-    await this.load();
+    const raw = this.fieldForm.value;
+    const options =
+      raw.fieldType === 'select'
+        ? String(raw.optionsText || '')
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean)
+        : [];
+    if (raw.fieldType === 'select' && options.length === 0) {
+      this.toast.warning('Options Required', 'Enter comma-separated options for a Select Dropdown field.');
+      return;
+    }
+    try {
+      await firstValueFrom(
+        this.api.addFieldConfig({
+          fieldKey: raw.fieldKey,
+          label: raw.label,
+          fieldType: raw.fieldType,
+          options,
+          isRequired: Boolean(raw.isRequired),
+          isEnabled: true,
+          isEditableOnResubmit: true,
+        }),
+      );
+      this.fieldForm.reset({fieldType: 'text', isRequired: false, optionsText: ''});
+      this.toast.success('Field Added', 'Dynamic registration field enabled.');
+      await this.load();
+    } catch (err: unknown) {
+      const msg = (err as {error?: {error?: string}})?.error?.error || 'Could not add field.';
+      this.toast.error('Error', msg);
+    }
   }
 
   async toggleFieldEnabled(f: Record<string, unknown>): Promise<void> {
-    await firstValueFrom(
-      this.api.updateFieldConfig(Number(f['id']), {
-        isRequired: Boolean(f['is_required']),
-        isEnabled: !f['is_enabled'],
-        isEditableOnResubmit: Boolean(f['is_editable_on_resubmit']),
-      }),
-    );
-    await this.load();
+    try {
+      await firstValueFrom(
+        this.api.updateFieldConfig(Number(f['id']), {
+          isRequired: Boolean(f['is_required']),
+          isEnabled: !f['is_enabled'],
+          isEditableOnResubmit: Boolean(f['is_editable_on_resubmit']),
+        }),
+      );
+      await this.load();
+    } catch (err: unknown) {
+      const msg = (err as {error?: {error?: string}})?.error?.error || 'Could not update field.';
+      this.toast.error('Error', msg);
+    }
   }
 
   async deleteField(id: number): Promise<void> {
-    await firstValueFrom(this.api.deleteFieldConfig(id));
-    this.toast.info('Field Removed', 'Custom field removed.');
-    await this.load();
+    try {
+      await firstValueFrom(this.api.deleteFieldConfig(id));
+      this.toast.info('Field Removed', 'Custom field removed.');
+      await this.load();
+    } catch (err: unknown) {
+      const msg = (err as {error?: {error?: string}})?.error?.error || 'Could not delete field.';
+      this.toast.error('Error', msg);
+    }
   }
 }

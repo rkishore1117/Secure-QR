@@ -118,7 +118,9 @@ describe('Secure QR Verification System — Crypto & API Integration', () => {
     });
     expect(sendOtpRes.status).toBe(200);
     expect(sendOtpRes.data['emailDispatched']).toBe(true);
-    expect(sendOtpRes.data['emailProvider']).toBe('gmail-smtp');
+    expect(['gmail-smtp', 'https-webhook', 'brevo-https', 'resend-https']).toContain(
+      sendOtpRes.data['emailProvider'],
+    );
     const hintOtp = String(sendOtpRes.data['devOtpHint']);
     expect(hintOtp).toMatch(/^\d{6}$/);
 
@@ -265,7 +267,53 @@ describe('Secure QR Verification System — Crypto & API Integration', () => {
       'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
     );
     expect(excelRes.raw.byteLength).toBeGreaterThan(1000);
-  }, 30000);
+
+    // 9. Forgot Password / Reset flow
+    const resetMissingRes = await requestJson(baseUrl, '/api/v1/auth/otp/send', {
+      method: 'POST',
+      body: JSON.stringify({email: `missing.${uniqueSuffix}@test.org`, purpose: 'PASSWORD_RESET'}),
+    });
+    expect(resetMissingRes.status).toBe(404);
+
+    const resetOtpSend = await requestJson(baseUrl, '/api/v1/auth/otp/send', {
+      method: 'POST',
+      body: JSON.stringify({email, purpose: 'PASSWORD_RESET'}),
+    });
+    expect(resetOtpSend.status).toBe(200);
+    expect(resetOtpSend.data['emailDispatched']).toBe(true);
+    const resetHintOtp = String(resetOtpSend.data['devOtpHint']);
+    expect(resetHintOtp).toMatch(/^\d{6}$/);
+
+    const resetOtpVerify = await requestJson(baseUrl, '/api/v1/auth/otp/verify', {
+      method: 'POST',
+      body: JSON.stringify({email, otp: resetHintOtp, purpose: 'PASSWORD_RESET'}),
+    });
+    expect(resetOtpVerify.status).toBe(200);
+    const resetVerificationId = Number(resetOtpVerify.data['otpVerificationId']);
+
+    const resetConfirm = await requestJson(baseUrl, '/api/v1/auth/password-reset/confirm', {
+      method: 'POST',
+      body: JSON.stringify({
+        email,
+        otpVerificationId: resetVerificationId,
+        newPassword: 'NewPassword@2026',
+      }),
+    });
+    expect(resetConfirm.status).toBe(200);
+    expect(resetConfirm.data['success']).toBe(true);
+
+    const oldPassLogin = await requestJson(baseUrl, '/api/v1/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({identifier: email, password: 'Password@2026'}),
+    });
+    expect(oldPassLogin.status).toBe(401);
+
+    const newPassLogin = await requestJson(baseUrl, '/api/v1/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({identifier: email, password: 'NewPassword@2026'}),
+    });
+    expect(newPassLogin.status).toBe(200);
+  }, 45000);
 
   it('authenticates fixed Super Admin, inspects DB/gateway status, and logs 24h Excel email dispatch', async () => {
     const fixedEmail = process.env['FIXED_ADMIN_EMAIL'] || 'kishore.sathayush@gmail.com';
@@ -315,6 +363,7 @@ describe('Secure QR Verification System — Crypto & API Integration', () => {
     expect(logsRes.status).toBe(200);
     expect(logsRes.data['recipientEmail']).toBe('kishore.sathayush@gmail.com');
     expect(logsRes.data['scheduleIntervalHours']).toBe(24);
+    expect(typeof logsRes.data['emailDeliveryMode']).toBe('string');
     const logs = logsRes.data['logs'] as Record<string, unknown>[];
     expect(logs.length).toBeGreaterThanOrEqual(1);
     expect(logs[0]['trigger_type']).toBe('MANUAL');

@@ -253,6 +253,7 @@ export class ApiService {
       recipientEmail: string;
       scheduleIntervalHours: number;
       smtpConfigured: boolean;
+      emailDeliveryMode?: string;
       logs: Record<string, unknown>[];
     }>('/api/v1/admin/export/scheduled-logs');
   }
@@ -299,6 +300,7 @@ export class ApiService {
       integrations: {
         smtpConfigured: boolean;
         emailOtpConfigured: boolean;
+        emailDeliveryMode?: string;
         smtpHost: string;
         smtpUser: string;
         dailyReportRecipient: string;

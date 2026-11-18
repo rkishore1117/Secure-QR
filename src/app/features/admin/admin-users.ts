@@ -107,13 +107,23 @@ export class AdminUsers implements OnInit {
   }
 
   async load(): Promise<void> {
-    const res = await firstValueFrom(this.api.getAdminUsers(this.searchForm.value.search || ''));
-    this.users.set(res.users);
+    try {
+      const res = await firstValueFrom(this.api.getAdminUsers(this.searchForm.value.search || ''));
+      this.users.set(res.users);
+    } catch (err: unknown) {
+      const msg = (err as {error?: {error?: string}})?.error?.error || 'Could not load user directory.';
+      this.toast.error('Load Failed', msg);
+    }
   }
 
   async toggleStatus(accountId: number, isActive: boolean): Promise<void> {
-    await firstValueFrom(this.api.updateUserAccountStatus(accountId, isActive));
-    this.toast.success('Account Updated', `User account ${isActive ? 'activated' : 'deactivated'}.`);
-    await this.load();
+    try {
+      await firstValueFrom(this.api.updateUserAccountStatus(accountId, isActive));
+      this.toast.success('Account Updated', `User account ${isActive ? 'activated' : 'deactivated'}.`);
+      await this.load();
+    } catch (err: unknown) {
+      const msg = (err as {error?: {error?: string}})?.error?.error || 'Could not update user status.';
+      this.toast.error('Error', msg);
+    }
   }
 }

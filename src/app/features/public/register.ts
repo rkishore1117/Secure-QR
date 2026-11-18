@@ -1,8 +1,8 @@
-import {ChangeDetectionStrategy, Component, OnInit, inject, signal} from '@angular/core';
+import {ChangeDetectionStrategy, Component, OnDestroy, OnInit, inject, signal} from '@angular/core';
 import {FormBuilder, ReactiveFormsModule, Validators} from '@angular/forms';
 import {RouterLink} from '@angular/router';
 import {MatIconModule} from '@angular/material/icon';
-import {firstValueFrom} from 'rxjs';
+import {Subscription, firstValueFrom} from 'rxjs';
 import {ApiService} from '../../core/services/api.service';
 import {ToastService} from '../../core/services/toast.service';
 import {DynamicFieldConfig} from '../../core/models/types';
@@ -501,10 +501,14 @@ import {DynamicFieldConfig} from '../../core/models/types';
     </div>
   `,
 })
-export class Register implements OnInit {
+export class Register implements OnInit, OnDestroy {
   private readonly fb = inject(FormBuilder);
   private readonly api = inject(ApiService);
   private readonly toast = inject(ToastService);
+
+  private cooldownTimer: ReturnType<typeof setInterval> | null = null;
+  private emailSub: Subscription | null = null;
+  private lastOtpEmail = '';
 
   protected readonly organizationName = signal('Secure QR Verification Authority');
   protected readonly idProofRequired = signal(true);
@@ -556,6 +560,21 @@ export class Register implements OnInit {
   });
 
   async ngOnInit(): Promise<void> {
+    this.emailSub = this.form.controls.email.valueChanges.subscribe((val) => {
+      const normalized = String(val || '').trim().toLowerCase();
+      if (!this.otpVerifiedId() && this.lastOtpEmail && normalized !== this.lastOtpEmail) {
+        this.otpSent.set(false);
+        this.emailNotice.set(null);
+        this.devOtpHint.set(null);
+        this.resendCooldown.set(0);
+        this.form.patchValue({otpCode: ''}, {emitEvent: false});
+        if (this.cooldownTimer) {
+          clearInterval(this.cooldownTimer);
+          this.cooldownTimer = null;
+        }
+      }
+    });
+
     try {
       const cfg = await firstValueFrom(this.api.getPublicFieldConfigs());
       this.organizationName.set(cfg.organizationName);
@@ -570,6 +589,14 @@ export class Register implements OnInit {
       }
     } catch {
       // keep base form functional
+    }
+  }
+
+  ngOnDestroy(): void {
+    this.emailSub?.unsubscribe();
+    if (this.cooldownTimer) {
+      clearInterval(this.cooldownTimer);
+      this.cooldownTimer = null;
     }
   }
 
@@ -596,6 +623,7 @@ export class Register implements OnInit {
     this.emailNotice.set(null);
     try {
       const res = await firstValueFrom(this.api.sendOtp(email, 'REGISTRATION'));
+      this.lastOtpEmail = email;
       this.otpSent.set(true);
       this.devOtpHint.set(!res.emailDispatched && res.devOtpHint ? res.devOtpHint : null);
       if (res.emailDispatched) {
@@ -736,11 +764,18 @@ export class Register implements OnInit {
   }
 
   private startCooldown(seconds: number): void {
+    if (this.cooldownTimer) {
+      clearInterval(this.cooldownTimer);
+      this.cooldownTimer = null;
+    }
     this.resendCooldown.set(seconds);
-    const timer = setInterval(() => {
+    this.cooldownTimer = setInterval(() => {
       const next = this.resendCooldown() - 1;
       this.resendCooldown.set(Math.max(0, next));
-      if (next <= 0) clearInterval(timer);
+      if (next <= 0 && this.cooldownTimer) {
+        clearInterval(this.cooldownTimer);
+        this.cooldownTimer = null;
+      }
     }, 1000);
   }
 }

@@ -1,0 +1,51 @@
+services:
+  - type: web
+    name: secure-qr-verification
+    runtime: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm run serve:ssr:app
+    healthCheckPath: /api/v1/public/field-configs
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: APP_URL
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: OTP_PEPPER
+        generateValue: true
+      - key: FIXED_ADMIN_EMAIL
+        value: kishore.sathayush@gmail.com
+      - key: FIXED_ADMIN_PASSWORD
+        sync: false
+      - key: DAILY_REPORT_RECIPIENT_EMAIL
+        value: kishore.sathayush@gmail.com
+      - key: DB_HOST
+        sync: false
+      - key: DB_PORT
+        value: "3306"
+      - key: DB_NAME
+        value: secure_qr_verification
+      - key: DB_USER
+        sync: false
+      - key: DB_PASSWORD
+        sync: false
+      - key: EMAIL_WEBHOOK_URL
+        sync: false
+      - key: EMAIL_WEBHOOK_SECRET
+        sync: false
+      - key: BREVO_API_KEY
+        sync: false
+      - key: DEFAULT_FROM_EMAIL
+        value: kishore.sathayush@gmail.com
+      - key: AWS_ACCESS_KEY_ID
+        sync: false
+      - key: AWS_SECRET_ACCESS_KEY
+        sync: false
+      - key: AWS_S3_REGION_NAME
+        value: ap-south-1
+      - key: AWS_STORAGE_BUCKET_NAME
+        value: sathayushstorage
+      - key: FILE_PATH
+        value: https://sathayushstorage.s3.ap-south-1.amazonaws.com/sathayush/

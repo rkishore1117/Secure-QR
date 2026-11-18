@@ -23,6 +23,18 @@ import {StatusText} from '../../shared/components/status-text';
 
       @if (loading()) {
         <div class="h-64 rounded-xl border border-slate-200 bg-white animate-pulse"></div>
+      } @else if (errorMsg()) {
+        <div class="rounded-xl border border-red-200 bg-red-50 p-6 space-y-3">
+          <p class="text-sm font-semibold text-red-900">{{ errorMsg() }}</p>
+          <button
+            type="button"
+            (click)="loadQrData()"
+            class="touch-target inline-flex items-center gap-2 rounded-lg bg-[#0F172A] px-4 py-2 text-xs font-semibold text-white hover:bg-[#1E3A5F]"
+          >
+            <mat-icon class="text-[16px]!">refresh</mat-icon>
+            <span>Retry</span>
+          </button>
+        </div>
       } @else if (record(); as rec) {
         @if (rec.approval_status === 'APPROVED' && activeQr(); as qr) {
           <div class="grid grid-cols-1 gap-6 lg:grid-cols-12 items-start">
@@ -111,16 +123,26 @@ export class UserQrCard implements OnInit {
   private readonly toast = inject(ToastService);
 
   protected readonly loading = signal(true);
+  protected readonly errorMsg = signal<string | null>(null);
   protected readonly record = signal<UserRecord | null>(null);
   protected readonly activeQr = signal<QRCodeItem | null>(null);
   protected readonly organizationName = signal('Secure QR Verification Authority');
 
-  async ngOnInit(): Promise<void> {
+  ngOnInit(): void {
+    void this.loadQrData();
+  }
+
+  async loadQrData(): Promise<void> {
+    this.loading.set(true);
+    this.errorMsg.set(null);
     try {
       const dash = await firstValueFrom(this.api.getUserDashboard());
       this.record.set(dash.record);
       this.activeQr.set(dash.activeQr);
       this.organizationName.set(dash.organizationName);
+    } catch (err: unknown) {
+      const msg = (err as {error?: {error?: string}})?.error?.error || 'Could not load QR credential details.';
+      this.errorMsg.set(msg);
     } finally {
       this.loading.set(false);
     }

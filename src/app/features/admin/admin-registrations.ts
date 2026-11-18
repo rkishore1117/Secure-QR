@@ -270,10 +270,11 @@ import {StatusText} from '../../shared/components/status-text';
                   ID Proof Document ({{ detail.record.id_proof_type }})
                 </p>
                 @if (detail.record.id_proof_url) {
-                  @if (detail.record.id_proof_url.endsWith('.pdf')) {
+                  @if (isPdfUrl(detail.record.id_proof_url)) {
                     <a
                       [href]="detail.record.id_proof_url"
                       target="_blank"
+                      rel="noopener noreferrer"
                       class="inline-flex items-center gap-1.5 text-xs font-semibold text-[#1E3A5F] underline"
                     >
                       <mat-icon class="text-[16px]!">picture_as_pdf</mat-icon>
@@ -298,7 +299,7 @@ import {StatusText} from '../../shared/components/status-text';
                 <div class="grid grid-cols-1 gap-2 sm:grid-cols-2 text-xs">
                   @for (entry of objectEntries(detail.record.dynamicFields); track entry[0]) {
                     <div class="rounded-lg border border-slate-200 px-3 py-2">
-                      <span class="text-slate-500">{{ entry[0] }}: </span>
+                      <span class="text-slate-500">{{ formatFieldKey(entry[0]) }}: </span>
                       <span class="font-semibold text-slate-900">{{ entry[1] || 'N/A' }}</span>
                     </div>
                   }
@@ -459,6 +460,9 @@ export class AdminRegistrations implements OnInit {
       this.page.set(res.page);
       this.availableStates.set(res.filters.states);
       this.availableCities.set(res.filters.cities);
+    } catch (err: unknown) {
+      const msg = (err as {error?: {error?: string}})?.error?.error || 'Could not load registration records.';
+      this.toast.error('Load Failed', msg);
     } finally {
       this.loading.set(false);
     }
@@ -466,8 +470,13 @@ export class AdminRegistrations implements OnInit {
 
   async openDetail(id: number): Promise<void> {
     this.actionForm.reset({note: ''});
-    const detail = await firstValueFrom(this.api.getAdminRegistrationDetail(id));
-    this.selectedDetail.set(detail);
+    try {
+      const detail = await firstValueFrom(this.api.getAdminRegistrationDetail(id));
+      this.selectedDetail.set(detail);
+    } catch (err: unknown) {
+      const msg = (err as {error?: {error?: string}})?.error?.error || 'Could not load application details.';
+      this.toast.error('Error', msg);
+    }
   }
 
   async approve(id: number): Promise<void> {
@@ -527,5 +536,18 @@ export class AdminRegistrations implements OnInit {
 
   objectEntries(obj: Record<string, string>): [string, string][] {
     return Object.entries(obj || {});
+  }
+
+  isPdfUrl(url: string): boolean {
+    const lower = url.toLowerCase();
+    return lower.includes('.pdf') || lower.startsWith('data:application/pdf');
+  }
+
+  formatFieldKey(key: string): string {
+    return key
+      .split('_')
+      .filter(Boolean)
+      .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+      .join(' ');
   }
 }
