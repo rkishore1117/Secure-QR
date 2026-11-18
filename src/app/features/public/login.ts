@@ -83,17 +83,36 @@ import {ToastService} from '../../core/services/toast.service';
             </div>
 
             <div>
-              <label for="login-pass" class="block text-xs font-semibold text-slate-700 mb-1.5">
-                Password
-              </label>
-              <input
-                id="login-pass"
-                type="password"
-                formControlName="password"
-                autocomplete="current-password"
-                placeholder="Enter your password"
-                class="w-full h-11 rounded-lg border border-slate-300 px-3.5 text-sm text-slate-900 focus:border-[#0F172A] focus:outline-none"
-              />
+              <div class="flex items-center justify-between gap-2 mb-1.5">
+                <label for="login-pass" class="block text-xs font-semibold text-slate-700">
+                  Password
+                </label>
+                <a
+                  routerLink="/forgot-password"
+                  [queryParams]="{portal: portalMode()}"
+                  class="text-xs font-semibold text-[#1E3A5F] hover:underline"
+                >
+                  Forgot Password?
+                </a>
+              </div>
+              <div class="relative">
+                <input
+                  id="login-pass"
+                  [type]="showPassword() ? 'text' : 'password'"
+                  formControlName="password"
+                  autocomplete="current-password"
+                  placeholder="Enter your password"
+                  class="w-full h-11 rounded-lg border border-slate-300 pl-3.5 pr-11 text-sm text-slate-900 focus:border-[#0F172A] focus:outline-none"
+                />
+                <button
+                  type="button"
+                  (click)="showPassword.set(!showPassword())"
+                  [attr.aria-label]="showPassword() ? 'Hide password' : 'Show password'"
+                  class="absolute inset-y-0 right-0 flex w-10 items-center justify-center text-slate-500 hover:text-slate-800"
+                >
+                  <mat-icon class="text-[20px]!">{{ showPassword() ? 'visibility_off' : 'visibility' }}</mat-icon>
+                </button>
+              </div>
             </div>
 
             @if (errorMsg()) {
@@ -110,6 +129,20 @@ import {ToastService} from '../../core/services/toast.service';
               <mat-icon class="text-[20px]!">lock_open</mat-icon>
               <span>{{ loading() ? 'Signing In...' : 'Sign In' }}</span>
             </button>
+
+            @if (portalMode() === 'ADMIN') {
+              <p class="text-[11px] leading-relaxed text-slate-500 text-center">
+                Forgotten or rotated admin password? Use
+                <a
+                  routerLink="/forgot-password"
+                  [queryParams]="{portal: 'ADMIN'}"
+                  class="font-semibold text-[#1E3A5F] hover:underline"
+                >
+                  Forgot Password
+                </a>
+                with your registered admin email.
+              </p>
+            }
           </form>
         </div>
       </main>
@@ -127,6 +160,7 @@ export class Login implements OnInit {
   protected readonly portalMode = signal<'USER' | 'ADMIN'>('USER');
   protected readonly loading = signal(false);
   protected readonly errorMsg = signal<string | null>(null);
+  protected readonly showPassword = signal(false);
 
   protected readonly form = this.fb.group({
     identifier: ['', Validators.required],

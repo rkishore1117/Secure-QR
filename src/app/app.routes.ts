@@ -26,6 +26,11 @@ export const routes: Routes = [
     loadComponent: () => import('./features/public/login').then((m) => m.Login),
   },
   {
+    path: 'forgot-password',
+    loadComponent: () =>
+      import('./features/public/forgot-password').then((m) => m.ForgotPassword),
+  },
+  {
     path: 'verify',
     loadComponent: () => import('./features/public/verify-public').then((m) => m.VerifyPublic),
   },

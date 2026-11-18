@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import {PutObjectCommand, S3Client} from '@aws-sdk/client-s3';
-import {getUploadsDir} from './db';
+import {getEnvValue, getUploadsDir} from './db';
 
 export interface StoredUploadResult {
   url: string;
@@ -53,12 +53,12 @@ export async function uploadBase64Media(
   const ext = extMap[mime] || 'bin';
   const filename = `${filePrefix}_${crypto.randomUUID()}.${ext}`;
 
-  const accessKeyId = process.env['AWS_ACCESS_KEY_ID'] || '';
-  const secretAccessKey = process.env['AWS_SECRET_ACCESS_KEY'] || '';
-  const region = process.env['AWS_S3_REGION_NAME'] || 'ap-south-1';
-  const bucket = process.env['AWS_STORAGE_BUCKET_NAME'] || '';
+  const accessKeyId = getEnvValue('AWS_ACCESS_KEY_ID');
+  const secretAccessKey = getEnvValue('AWS_SECRET_ACCESS_KEY');
+  const region = getEnvValue('AWS_S3_REGION_NAME') || 'ap-south-1';
+  const bucket = getEnvValue('AWS_STORAGE_BUCKET_NAME');
   const filePathBase =
-    process.env['FILE_PATH'] ||
+    getEnvValue('FILE_PATH') ||
     (bucket ? `https://${bucket}.s3.${region}.amazonaws.com/sathayush/` : '');
 
   const normalizedBase = filePathBase.endsWith('/') ? filePathBase : `${filePathBase}/`;

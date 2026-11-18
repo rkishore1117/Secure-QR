@@ -151,13 +151,23 @@ import {DynamicFieldConfig} from '../../core/models/types';
                   <label for="reg-password" class="block text-xs font-semibold text-slate-700 mb-1.5">
                     Account Password (min 8 chars) <span class="text-red-600">*</span>
                   </label>
-                  <input
-                    id="reg-password"
-                    type="password"
-                    formControlName="password"
-                    placeholder="Minimum 8 characters"
-                    class="w-full h-11 rounded-lg border border-slate-300 px-3.5 text-sm text-slate-900 focus:border-[#0F172A] focus:outline-none"
-                  />
+                  <div class="relative">
+                    <input
+                      id="reg-password"
+                      [type]="showPassword() ? 'text' : 'password'"
+                      formControlName="password"
+                      placeholder="Minimum 8 characters"
+                      class="w-full h-11 rounded-lg border border-slate-300 pl-3.5 pr-11 text-sm text-slate-900 focus:border-[#0F172A] focus:outline-none"
+                    />
+                    <button
+                      type="button"
+                      (click)="showPassword.set(!showPassword())"
+                      [attr.aria-label]="showPassword() ? 'Hide password' : 'Show password'"
+                      class="absolute inset-y-0 right-0 flex w-10 items-center justify-center text-slate-500 hover:text-slate-800"
+                    >
+                      <mat-icon class="text-[20px]!">{{ showPassword() ? 'visibility_off' : 'visibility' }}</mat-icon>
+                    </button>
+                  </div>
                 </div>
 
                 <div>
@@ -237,10 +247,19 @@ import {DynamicFieldConfig} from '../../core/models/types';
                     </p>
                   }
                   @if (devOtpHint()) {
-                    <p class="text-xs text-slate-700">
-                      Fallback Verification Code:
-                      <span class="font-mono font-bold text-[#0F172A]">{{ devOtpHint() }}</span>
-                    </p>
+                    <div class="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
+                      <div>
+                        <span class="font-medium">One-Time Verification Code: </span>
+                        <span class="font-mono text-sm font-bold tracking-wider text-[#0F172A]">{{ devOtpHint() }}</span>
+                      </div>
+                      <button
+                        type="button"
+                        (click)="applyDevOtpHint()"
+                        class="rounded-md border border-amber-300 bg-white px-2.5 py-1 text-[11px] font-semibold text-amber-900 hover:bg-amber-100"
+                      >
+                        Use Code
+                      </button>
+                    </div>
                   }
                   <div class="flex flex-col gap-3 sm:flex-row sm:items-end">
                     <div class="flex-1 max-w-xs">
@@ -507,6 +526,7 @@ export class Register implements OnInit {
   protected readonly idProofName = signal<string | null>(null);
 
   protected readonly submitting = signal(false);
+  protected readonly showPassword = signal(false);
   protected readonly errorMsg = signal<string | null>(null);
   protected readonly submittedResult = signal<{
     registrationId: string;
@@ -582,6 +602,10 @@ export class Register implements OnInit {
         const notice = `A 6-digit verification code has been sent to ${email}. Check your inbox or spam folder.`;
         this.emailNotice.set(notice);
         this.toast.success('Email OTP Sent', `Verification code sent to ${email}.`);
+      } else if (res.devOtpHint) {
+        const notice = `Email delivery unavailable (${res.emailError || 'SMTP unavailable'}). Use the verification code below to continue.`;
+        this.emailNotice.set(notice);
+        this.toast.info('Verification Code Ready', 'Use the on-screen 6-digit code to verify your email and continue.');
       } else {
         const notice = `Could not deliver verification email (${res.emailError || 'SMTP unavailable'}).`;
         this.emailNotice.set(notice);
@@ -593,6 +617,13 @@ export class Register implements OnInit {
       this.toast.error('OTP Error', msg);
     } finally {
       this.sendingOtp.set(false);
+    }
+  }
+
+  applyDevOtpHint(): void {
+    const code = this.devOtpHint();
+    if (code) {
+      this.form.patchValue({otpCode: code});
     }
   }
 

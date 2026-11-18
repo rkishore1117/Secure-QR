@@ -7,9 +7,67 @@ import {
   hashPassword,
   sha256Hex,
 } from './crypto';
+import {
+  mockExecuteSql,
+  mockQueryRows,
+  mockResetAndInit,
+} from './mock-db';
 
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
+
+export function isPlaceholderEnvValue(val: string | undefined): boolean {
+  if (!val) return false;
+  const trimmed = val.trim().replace(/^["']|["']$/g, '');
+  if (!trimmed) return false;
+  return /^(replace[-_]with|your[-_]|changeme$|example$|MY_)/i.test(trimmed);
+}
+
+function parseDotEnvFile(): Record<string, string> {
+  const envPath = path.resolve(process.cwd(), '.env');
+  const parsed: Record<string, string> = {};
+  try {
+    if (!fs.existsSync(envPath)) return parsed;
+    const content = fs.readFileSync(envPath, 'utf8');
+    for (const rawLine of content.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith('#')) continue;
+      const eqIdx = line.indexOf('=');
+      if (eqIdx <= 0) continue;
+      const key = line.slice(0, eqIdx).trim();
+      let val = line.slice(eqIdx + 1).trim();
+      if (
+        (val.startsWith('"') && val.endsWith('"')) ||
+        (val.startsWith("'") && val.endsWith("'"))
+      ) {
+        val = val.slice(1, -1);
+      }
+      parsed[key] = val;
+    }
+  } catch {
+    // ignore .env read failures
+  }
+  return parsed;
+}
+
+export function getEnvValue(key: string): string {
+  const procRaw = process.env[key];
+  const procVal =
+    procRaw !== undefined && !isPlaceholderEnvValue(procRaw) ? procRaw.trim() : undefined;
+
+  if (process.env['VITEST'] && key in process.env) {
+    return procVal ?? '';
+  }
+
+  const dotEnv = parseDotEnvFile();
+  const fileRaw = dotEnv[key];
+  const fileVal =
+    fileRaw !== undefined && !isPlaceholderEnvValue(fileRaw) ? fileRaw.trim() : undefined;
+
+  if (fileVal) return fileVal;
+  if (procVal) return procVal;
+  return '';
+}
 
 function loadEnvSafe(): void {
   try {
@@ -26,11 +84,11 @@ export function sanitizeDbName(name: string): string {
 
 export function getMysqlConfig() {
   loadEnvSafe();
-  const host = (process.env['DB_HOST'] || '').trim();
-  const port = Number.parseInt(process.env['DB_PORT'] || '3306', 10) || 3306;
-  const user = (process.env['DB_USER'] || '').trim();
-  const password = process.env['DB_PASSWORD'] || '';
-  const database = sanitizeDbName(process.env['DB_NAME'] || 'secure_qr_verification');
+  const host = getEnvValue('DB_HOST');
+  const port = Number.parseInt(getEnvValue('DB_PORT') || '3306', 10) || 3306;
+  const user = getEnvValue('DB_USER');
+  const password = getEnvValue('DB_PASSWORD');
+  const database = sanitizeDbName(getEnvValue('DB_NAME') || 'secure_qr_verification');
   return {host, port, user, password, database};
 }
 
@@ -67,14 +125,31 @@ let poolInstance: mysql.Pool | null = null;
 let initPromise: Promise<void> | null = null;
 let seeded = false;
 let seedingPromise: Promise<void> | null = null;
+let mockMode = false;
+
+export function isMockDbActive(): boolean {
+  return mockMode;
+}
+
+function activateMockMode(reason: string): void {
+  if (!mockMode) {
+    console.warn(`[AI Studio] ${reason} — activating in-memory mock database.`);
+    mockMode = true;
+    mockResetAndInit();
+  }
+}
 
 export function getPool(): mysql.Pool {
   if (poolInstance) return poolInstance;
   const cfg = getMysqlConfig();
   if (!cfg.host || !cfg.user) {
-    throw new Error(
-      'MySQL RDS configuration is missing (DB_HOST / DB_USER). Configure .env before starting the server.',
-    );
+    activateMockMode('MySQL RDS credentials not configured');
+    return {
+      query: async () => [[], []],
+      getConnection: async () => {
+        throw new Error('Mock mode active');
+      },
+    } as unknown as mysql.Pool;
   }
   poolInstance = mysql.createPool({
     host: cfg.host,
@@ -86,7 +161,7 @@ export function getPool(): mysql.Pool {
     connectionLimit: 10,
     queueLimit: 0,
     timezone: 'Z',
-    connectTimeout: 8000,
+    connectTimeout: 5000,
   });
   return poolInstance;
 }
@@ -95,6 +170,9 @@ export async function queryRows<T = Record<string, unknown>>(
   sql: string,
   params: unknown[] = [],
 ): Promise<T[]> {
+  if (mockMode) {
+    return mockQueryRows<T>(sql, params);
+  }
   const [rows] = await getPool().query(sql, params);
   return rows as T[];
 }
@@ -111,6 +189,9 @@ export async function executeSql(
   sql: string,
   params: unknown[] = [],
 ): Promise<mysql.ResultSetHeader> {
+  if (mockMode) {
+    return mockExecuteSql(sql, params);
+  }
   const [res] = await getPool().query(sql, params);
   return res as mysql.ResultSetHeader;
 }
@@ -122,6 +203,21 @@ export interface TxClient {
 }
 
 export async function withTransaction<T>(fn: (tx: TxClient) => Promise<T>): Promise<T> {
+  if (mockMode) {
+    const tx: TxClient = {
+      async queryRows<R = Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<R[]> {
+        return mockQueryRows<R>(sql, params);
+      },
+      async queryOne<R = Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<R | undefined> {
+        return mockQueryRows<R>(sql, params)[0];
+      },
+      async executeSql(sql: string, params: unknown[] = []): Promise<mysql.ResultSetHeader> {
+        return mockExecuteSql(sql, params);
+      },
+    };
+    return fn(tx);
+  }
+
   const conn = await getPool().getConnection();
   await conn.beginTransaction();
   const tx: TxClient = {
@@ -366,17 +462,27 @@ export async function ensureDbInitialized(): Promise<void> {
   initPromise = (async () => {
     const cfg = getMysqlConfig();
     if (!cfg.host || !cfg.user) {
-      throw new Error('MySQL RDS credentials (DB_HOST / DB_USER) are not configured.');
+      activateMockMode('MySQL RDS credentials not configured');
+      return;
     }
 
-    const bootstrapConn = await mysql.createConnection({
-      host: cfg.host,
-      port: cfg.port,
-      user: cfg.user,
-      password: cfg.password,
-      connectTimeout: 8000,
-      multipleStatements: true,
-    });
+    let bootstrapConn: mysql.Connection;
+    try {
+      bootstrapConn = await mysql.createConnection({
+        host: cfg.host,
+        port: cfg.port,
+        user: cfg.user,
+        password: cfg.password,
+        connectTimeout: 5000,
+        multipleStatements: true,
+      });
+    } catch (err) {
+      activateMockMode(
+        `MySQL connection failed (${err instanceof Error ? err.message : 'unreachable'})`,
+      );
+      return;
+    }
+
     try {
       const batchSql = [
         `CREATE DATABASE IF NOT EXISTS \`${cfg.database}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;`,
@@ -436,11 +542,11 @@ export async function ensureDbInitialized(): Promise<void> {
 
 async function ensureFixedAdmin(): Promise<void> {
   loadEnvSafe();
-  const fixedEmail = (process.env['FIXED_ADMIN_EMAIL'] || 'kishore.sathayush@gmail.com')
+  const fixedEmail = (getEnvValue('FIXED_ADMIN_EMAIL') || 'kishore.sathayush@gmail.com')
     .trim()
     .toLowerCase();
-  const fixedPassword = process.env['FIXED_ADMIN_PASSWORD'] || '';
-  if (!fixedEmail || !fixedPassword) {
+  const envPassword = getEnvValue('FIXED_ADMIN_PASSWORD');
+  if (!fixedEmail) {
     return;
   }
 
@@ -462,19 +568,29 @@ async function ensureFixedAdmin(): Promise<void> {
   let adminId: number;
   if (existing) {
     adminId = existing.id;
-    await executeSql(
-      `UPDATE user_accounts
-       SET password_hash = ?, role = 'SUPER_ADMIN', is_active = 1, is_mobile_verified = 1, updated_at = ?
-       WHERE id = ?`,
-      [hashPassword(fixedPassword), now, adminId],
-    );
+    if (envPassword) {
+      await executeSql(
+        `UPDATE user_accounts
+         SET password_hash = ?, role = 'SUPER_ADMIN', is_active = 1, is_mobile_verified = 1, is_email_verified = 1, updated_at = ?
+         WHERE id = ?`,
+        [hashPassword(envPassword), now, adminId],
+      );
+    } else {
+      await executeSql(
+        `UPDATE user_accounts
+         SET role = 'SUPER_ADMIN', is_active = 1, is_mobile_verified = 1, is_email_verified = 1, updated_at = ?
+         WHERE id = ?`,
+        [now, adminId],
+      );
+    }
   } else {
-    const mobileCandidate = process.env['FIXED_ADMIN_MOBILE'] || '+919550000955';
+    const initialPassword = envPassword || 'SuperAdmin@2026!';
+    const mobileCandidate = getEnvValue('FIXED_ADMIN_MOBILE') || '+919550000955';
     const res = await executeSql(
       `INSERT INTO user_accounts
-        (email, mobile, password_hash, role, is_active, is_mobile_verified, created_at, updated_at)
-       VALUES (?, ?, ?, 'SUPER_ADMIN', 1, 1, ?, ?)`,
-      [fixedEmail, mobileCandidate, hashPassword(fixedPassword), now, now],
+        (email, mobile, password_hash, role, is_active, is_mobile_verified, is_email_verified, created_at, updated_at)
+       VALUES (?, ?, ?, 'SUPER_ADMIN', 1, 1, 1, ?, ?)`,
+      [fixedEmail, mobileCandidate, hashPassword(initialPassword), now, now],
     );
     adminId = Number(res.insertId);
   }

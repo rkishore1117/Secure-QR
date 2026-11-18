@@ -82,9 +82,9 @@ app.use((req, res, next) => {
 const server = createServer(app);
 
 if (isMainModule(import.meta.url) || process.env['pm_id']) {
-  const port = process.env['PORT'] || 3000;
-  server.listen(port, () => {
-    console.log(`Secure QR Verification server listening on http://localhost:${port}`);
+  const port = Number(process.env['PORT']) || 3000;
+  server.listen(port, '0.0.0.0', () => {
+    console.log(`Secure QR Verification server listening on http://0.0.0.0:${port}`);
   });
 }
 

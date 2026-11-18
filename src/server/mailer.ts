@@ -1,5 +1,5 @@
 import nodemailer from 'nodemailer';
-import {executeSql, queryOne, toMysqlDateTime} from './db';
+import {executeSql, getEnvValue, queryOne, toMysqlDateTime} from './db';
 import {buildVerifiedUsersWorkbook} from './excel';
 
 let dailyIntervalHandle: ReturnType<typeof setInterval> | null = null;
@@ -20,12 +20,29 @@ export interface EmailOtpResult {
   error?: string;
 }
 
+function formatSmtpError(err: unknown): string {
+  const raw = err instanceof Error ? err.message : 'SMTP email delivery failed';
+  if (
+    raw.includes('535') ||
+    raw.toLowerCase().includes('username and password not accepted') ||
+    raw.toLowerCase().includes('badcredentials')
+  ) {
+    return 'Gmail SMTP rejected the login (535-5.7.8). Use a 16-character Google App Password (with 2-Step Verification enabled) in EMAIL_HOST_PASSWORD instead of your account password.';
+  }
+  return raw;
+}
+
 function createSmtpTransport() {
-  const host = process.env['EMAIL_HOST'] || 'smtp.gmail.com';
-  const port = Number.parseInt(process.env['EMAIL_PORT'] || '587', 10) || 587;
-  const useTls = (process.env['EMAIL_USE_TLS'] || 'True').toLowerCase() === 'true';
-  const user = (process.env['EMAIL_HOST_USER'] || '').trim();
-  const pass = process.env['EMAIL_HOST_PASSWORD'] || '';
+  const host = getEnvValue('EMAIL_HOST') || 'smtp.gmail.com';
+  const port = Number.parseInt(getEnvValue('EMAIL_PORT') || '587', 10) || 587;
+  const useTls = (getEnvValue('EMAIL_USE_TLS') || 'True').toLowerCase() === 'true';
+  const user = getEnvValue('EMAIL_HOST_USER').replace(/^["']|["']$/g, '');
+  const rawPass = getEnvValue('EMAIL_HOST_PASSWORD').replace(/^["']|["']$/g, '');
+  const compactPass = rawPass.replace(/\s+/g, '');
+  const pass =
+    host.toLowerCase().includes('gmail') && /^[a-zA-Z0-9]{16}$/.test(compactPass)
+      ? compactPass
+      : rawPass;
 
   if (!user || !pass) {
     return null;
@@ -51,10 +68,11 @@ export async function sendVerificationOtpEmail(
   otp: string,
   expiryMinutes = 5,
   isResend = false,
+  purpose: 'REGISTRATION' | 'PASSWORD_RESET' | string = 'REGISTRATION',
 ): Promise<EmailOtpResult> {
   const fromEmail =
-    (process.env['DEFAULT_FROM_EMAIL'] || '').trim() ||
-    (process.env['EMAIL_HOST_USER'] || '').trim() ||
+    getEnvValue('DEFAULT_FROM_EMAIL') ||
+    getEnvValue('EMAIL_HOST_USER') ||
     'kishore.sathayush@gmail.com';
 
   const transport = createSmtpTransport();
@@ -67,19 +85,31 @@ export async function sendVerificationOtpEmail(
     };
   }
 
+  const isReset = purpose === 'PASSWORD_RESET';
+  const subject = isReset
+    ? isResend
+      ? `Resent Password Reset Code (${otp}) — Secure QR`
+      : `Password Reset Verification Code (${otp}) — Secure QR`
+    : isResend
+      ? `Your Resent Verification Code (${otp}) — Secure QR`
+      : `Your Verification Code (${otp}) — Secure QR`;
+
+  const heading = isReset ? 'Reset Your Password' : 'Verify Your Email Address';
+  const intro = isReset
+    ? 'Use the 6-digit verification code below to reset your Secure QR account password.'
+    : 'Use the 6-digit verification code below to finish setting up your Secure QR registration.';
+
   try {
     await transport.sendMail({
       from: `"Secure QR Verification" <${fromEmail}>`,
       to: recipientEmail,
-      subject: isResend
-        ? `Your Resent Verification Code (${otp}) — Secure QR`
-        : `Your Verification Code (${otp}) — Secure QR`,
-      text: `Hello,\n\nYour one-time verification code to verify your Secure QR account email is: ${otp}\n\nThis code is valid for ${expiryMinutes} minutes. Please do not share it with anyone.\n\nIf you did not request this code, you can safely ignore this email.\n\nThank you,\nTeam Sathayush`,
+      subject,
+      text: `Hello,\n\n${intro}\n\nVerification code: ${otp}\n\nThis code is valid for ${expiryMinutes} minutes. Please do not share it with anyone.\n\nIf you did not request this code, you can safely ignore this email.\n\nThank you,\nTeam Sathayush`,
       html: `
         <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif; color: #0F172A; line-height: 1.6; max-width: 520px; margin: 0 auto; border: 1px solid #E2E8F0; border-radius: 12px; padding: 28px; background: #FFFFFF;">
-          <h2 style="margin: 0 0 10px 0; color: #0F172A; font-size: 20px;">Verify Your Email Address</h2>
+          <h2 style="margin: 0 0 10px 0; color: #0F172A; font-size: 20px;">${heading}</h2>
           <p style="margin: 0 0 18px 0; color: #475569; font-size: 14px;">
-            Use the 6-digit verification code below to finish setting up your Secure QR registration.
+            ${intro}
           </p>
           <div style="background: #F8FAFC; border: 1px solid #CBD5E1; border-radius: 10px; padding: 18px; text-align: center; margin: 20px 0;">
             <span style="font-family: 'SFMono-Regular', Consolas, monospace; font-size: 32px; font-weight: 700; letter-spacing: 8px; color: #0F172A;">${otp}</span>
@@ -104,7 +134,7 @@ export async function sendVerificationOtpEmail(
       dispatched: false,
       provider: 'gmail-smtp',
       recipient: recipientEmail,
-      error: err instanceof Error ? err.message : 'SMTP email delivery failed',
+      error: formatSmtpError(err),
     };
   }
 }
@@ -113,12 +143,12 @@ export async function sendDailyVerificationExcelReport(
   triggerType: 'SCHEDULED_24H' | 'MANUAL' = 'SCHEDULED_24H',
 ): Promise<EmailReportResult> {
   const recipient =
-    process.env['DAILY_REPORT_RECIPIENT_EMAIL'] ||
-    process.env['FIXED_ADMIN_EMAIL'] ||
+    getEnvValue('DAILY_REPORT_RECIPIENT_EMAIL') ||
+    getEnvValue('FIXED_ADMIN_EMAIL') ||
     'kishore.sathayush@gmail.com';
   const fromEmail =
-    process.env['DEFAULT_FROM_EMAIL'] ||
-    process.env['EMAIL_HOST_USER'] ||
+    getEnvValue('DEFAULT_FROM_EMAIL') ||
+    getEnvValue('EMAIL_HOST_USER') ||
     'kishore.sathayush@gmail.com';
   const now = new Date();
   const sentAtIso = now.toISOString();
@@ -191,7 +221,7 @@ export async function sendDailyVerificationExcelReport(
 
     return {success: true, recipient, recordCount, filename, sentAt: sentAtIso};
   } catch (err) {
-    const errMsg = err instanceof Error ? err.message : 'SMTP delivery failed';
+    const errMsg = formatSmtpError(err);
     await executeSql(
       `INSERT INTO scheduled_report_logs
         (recipient_email, record_count, filename, status, error_message, trigger_type, sent_at)

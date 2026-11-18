@@ -5,6 +5,7 @@ import QRCode from 'qrcode';
 import {
   ensureSeeded,
   executeSql,
+  getEnvValue,
   getMysqlConfig,
   getUploadsDir,
   parseJsonSafe,
@@ -517,6 +518,23 @@ export function createApiRouter(): express.Router {
           res.status(409).json({error: 'This email address is already registered.'});
           return;
         }
+      } else if (purpose === 'PASSWORD_RESET') {
+        const account = await queryOne<{
+          id: number;
+          is_active: number;
+          deleted_at: Date | string | null;
+        }>(
+          'SELECT id, is_active, deleted_at FROM user_accounts WHERE LOWER(email) = ?',
+          [email],
+        );
+        if (!account || account.deleted_at) {
+          res.status(404).json({error: 'No account found with this email address.'});
+          return;
+        }
+        if (!account.is_active) {
+          res.status(403).json({error: 'This account has been deactivated by an administrator.'});
+          return;
+        }
       }
 
       // Enforce 30-second resend cooldown & max 5 OTPs per 30 mins
@@ -559,13 +577,12 @@ export function createApiRouter(): express.Router {
       );
 
       const isResend = recentOtps.length > 0;
-      const emailResult = await sendVerificationOtpEmail(email, otp, expiryMinutes, isResend);
+      const emailResult = await sendVerificationOtpEmail(email, otp, expiryMinutes, isResend, purpose);
+      const hintFlag = (process.env['ALLOW_DEV_OTP_HINT'] || '').trim().toLowerCase();
       const allowDevHint =
-        process.env['NODE_ENV'] !== 'production' &&
-        (process.env['ALLOW_DEV_OTP_HINT'] ?? 'true') === 'true' &&
-        (!emailResult.dispatched || Boolean(process.env['VITEST']));
+        hintFlag !== 'false' && (!emailResult.dispatched || Boolean(process.env['VITEST']));
 
-      if (!emailResult.dispatched && process.env['NODE_ENV'] !== 'production') {
+      if (!emailResult.dispatched) {
         console.log(
           `[EMAIL OTP NOTICE] OTP for ${email}: ${otp} | provider=${emailResult.provider} | err=${emailResult.error || 'none'}`,
         );
@@ -593,24 +610,39 @@ export function createApiRouter(): express.Router {
     async (req: Request, res: Response) => {
       const email = String(req.body?.email || '').trim().toLowerCase();
       const otp = String(req.body?.otp || '').trim();
+      const purpose = req.body?.purpose ? String(req.body.purpose).trim().toUpperCase() : '';
       if (!/^\S+@\S+\.\S+$/.test(email) || !/^\d{6}$/.test(otp)) {
         res.status(400).json({error: 'Valid email address and 6-digit OTP are required.'});
         return;
       }
 
-      const latest = await queryOne<{
-        id: number;
-        otp_hash: string;
-        expires_at: Date | string;
-        attempts: number;
-        max_attempts: number;
-        verified_at: Date | string | null;
-      }>(
-        `SELECT * FROM otp_verifications
-         WHERE LOWER(email) = ? AND used_at IS NULL
-         ORDER BY id DESC LIMIT 1`,
-        [email],
-      );
+      const latest = purpose
+        ? await queryOne<{
+            id: number;
+            otp_hash: string;
+            expires_at: Date | string;
+            attempts: number;
+            max_attempts: number;
+            verified_at: Date | string | null;
+          }>(
+            `SELECT * FROM otp_verifications
+             WHERE LOWER(email) = ? AND purpose = ? AND used_at IS NULL
+             ORDER BY id DESC LIMIT 1`,
+            [email, purpose],
+          )
+        : await queryOne<{
+            id: number;
+            otp_hash: string;
+            expires_at: Date | string;
+            attempts: number;
+            max_attempts: number;
+            verified_at: Date | string | null;
+          }>(
+            `SELECT * FROM otp_verifications
+             WHERE LOWER(email) = ? AND used_at IS NULL
+             ORDER BY id DESC LIMIT 1`,
+            [email],
+          );
 
       if (!latest) {
         res.status(400).json({error: 'No active OTP request found. Please request a new code.'});
@@ -647,6 +679,97 @@ export function createApiRouter(): express.Router {
         verified: true,
         otpVerificationId: latest.id,
         verifiedAt: now.toISOString(),
+      });
+    },
+  );
+
+  // Confirm Password Reset via Verified Email OTP
+  router.post(
+    '/auth/password-reset/confirm',
+    rateLimit('password_reset', 10, 15 * 60 * 1000),
+    async (req: Request, res: Response) => {
+      const email = String(req.body?.email || '').trim().toLowerCase();
+      const otpVerificationId = Number(req.body?.otpVerificationId || 0);
+      const newPassword = String(req.body?.newPassword || '');
+
+      if (!/^\S+@\S+\.\S+$/.test(email) || !otpVerificationId) {
+        res.status(400).json({error: 'Email address and verified OTP confirmation are required.'});
+        return;
+      }
+      if (newPassword.length < 8) {
+        res.status(400).json({error: 'New password must be at least 8 characters long.'});
+        return;
+      }
+
+      const otpRec = await queryOne<{
+        id: number;
+        purpose: string;
+        verified_at: Date | string | null;
+        used_at: Date | string | null;
+        expires_at: Date | string;
+      }>(
+        `SELECT id, purpose, verified_at, used_at, expires_at
+         FROM otp_verifications
+         WHERE id = ? AND LOWER(email) = ? AND purpose = 'PASSWORD_RESET'`,
+        [otpVerificationId, email],
+      );
+
+      if (!otpRec || !otpRec.verified_at || otpRec.used_at) {
+        res.status(400).json({
+          error: 'Password reset verification is invalid or already used. Request a new code.',
+        });
+        return;
+      }
+      if (new Date(otpRec.expires_at).getTime() < Date.now()) {
+        res.status(400).json({error: 'Verification code has expired. Please request a new code.'});
+        return;
+      }
+
+      const account = await queryOne<{
+        id: number;
+        email: string;
+        role: 'SUPER_ADMIN' | 'ADMIN' | 'USER';
+        is_active: number;
+        deleted_at: Date | string | null;
+      }>(
+        'SELECT id, email, role, is_active, deleted_at FROM user_accounts WHERE LOWER(email) = ?',
+        [email],
+      );
+
+      if (!account || !account.is_active || account.deleted_at) {
+        res.status(404).json({error: 'Active account not found.'});
+        return;
+      }
+
+      const nowMysql = toMysqlDateTime();
+      await withTransaction(async (tx) => {
+        await tx.executeSql('UPDATE otp_verifications SET used_at = ? WHERE id = ?', [
+          nowMysql,
+          otpRec.id,
+        ]);
+        await tx.executeSql(
+          'UPDATE user_accounts SET password_hash = ?, is_email_verified = 1, updated_at = ? WHERE id = ?',
+          [hashPassword(newPassword), nowMysql, account.id],
+        );
+        await tx.executeSql(
+          'UPDATE refresh_tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL',
+          [nowMysql, account.id],
+        );
+      });
+
+      await writeAuditLog(
+        {id: account.id, email: account.email, role: account.role},
+        'PASSWORD_RESET_COMPLETED',
+        'USER_ACCOUNT',
+        account.id,
+        {via: 'EMAIL_OTP'},
+        req.ip,
+      );
+
+      res.json({
+        success: true,
+        role: account.role,
+        message: 'Your password has been reset. Sign in with your new password.',
       });
     },
   );
@@ -2399,12 +2522,12 @@ export function createApiRouter(): express.Router {
       const logs = await queryRows('SELECT * FROM scheduled_report_logs ORDER BY id DESC LIMIT 30');
       res.json({
         recipientEmail:
-          process.env['DAILY_REPORT_RECIPIENT_EMAIL'] ||
-          process.env['FIXED_ADMIN_EMAIL'] ||
+          getEnvValue('DAILY_REPORT_RECIPIENT_EMAIL') ||
+          getEnvValue('FIXED_ADMIN_EMAIL') ||
           'kishore.sathayush@gmail.com',
         scheduleIntervalHours: 24,
         smtpConfigured: Boolean(
-          process.env['EMAIL_HOST_USER'] && process.env['EMAIL_HOST_PASSWORD'],
+          getEnvValue('EMAIL_HOST_USER') && getEnvValue('EMAIL_HOST_PASSWORD'),
         ),
         logs,
       });
@@ -2593,26 +2716,26 @@ export function createApiRouter(): express.Router {
         },
         integrations: {
           smtpConfigured: Boolean(
-            process.env['EMAIL_HOST_USER'] && process.env['EMAIL_HOST_PASSWORD'],
+            getEnvValue('EMAIL_HOST_USER') && getEnvValue('EMAIL_HOST_PASSWORD'),
           ),
           emailOtpConfigured: Boolean(
-            process.env['EMAIL_HOST_USER'] && process.env['EMAIL_HOST_PASSWORD'],
+            getEnvValue('EMAIL_HOST_USER') && getEnvValue('EMAIL_HOST_PASSWORD'),
           ),
-          smtpHost: process.env['EMAIL_HOST'] || 'smtp.gmail.com',
-          smtpUser: process.env['EMAIL_HOST_USER'] || '',
+          smtpHost: getEnvValue('EMAIL_HOST') || 'smtp.gmail.com',
+          smtpUser: getEnvValue('EMAIL_HOST_USER'),
           dailyReportRecipient:
-            process.env['DAILY_REPORT_RECIPIENT_EMAIL'] ||
-            process.env['FIXED_ADMIN_EMAIL'] ||
+            getEnvValue('DAILY_REPORT_RECIPIENT_EMAIL') ||
+            getEnvValue('FIXED_ADMIN_EMAIL') ||
             'kishore.sathayush@gmail.com',
           s3Configured: Boolean(
-            process.env['AWS_ACCESS_KEY_ID'] &&
-              process.env['AWS_SECRET_ACCESS_KEY'] &&
-              process.env['AWS_STORAGE_BUCKET_NAME'],
+            getEnvValue('AWS_ACCESS_KEY_ID') &&
+              getEnvValue('AWS_SECRET_ACCESS_KEY') &&
+              getEnvValue('AWS_STORAGE_BUCKET_NAME'),
           ),
-          s3Bucket: process.env['AWS_STORAGE_BUCKET_NAME'] || '',
-          s3Region: process.env['AWS_S3_REGION_NAME'] || '',
-          filePath: process.env['FILE_PATH'] || '',
-          fixedAdminEmail: process.env['FIXED_ADMIN_EMAIL'] || 'kishore.sathayush@gmail.com',
+          s3Bucket: getEnvValue('AWS_STORAGE_BUCKET_NAME'),
+          s3Region: getEnvValue('AWS_S3_REGION_NAME'),
+          filePath: getEnvValue('FILE_PATH'),
+          fixedAdminEmail: getEnvValue('FIXED_ADMIN_EMAIL') || 'kishore.sathayush@gmail.com',
         },
       });
     },

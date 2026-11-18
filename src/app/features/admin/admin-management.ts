@@ -44,7 +44,22 @@ import {ToastService} from '../../core/services/toast.service';
           </div>
           <div>
             <label for="adm-pw" class="block text-xs font-semibold text-slate-700 mb-1">Temporary Password</label>
-            <input id="adm-pw" type="password" formControlName="password" class="w-full h-10 rounded-lg border border-slate-300 px-3 text-xs" />
+            <div class="relative">
+              <input
+                id="adm-pw"
+                [type]="showPassword() ? 'text' : 'password'"
+                formControlName="password"
+                class="w-full h-10 rounded-lg border border-slate-300 pl-3 pr-10 text-xs"
+              />
+              <button
+                type="button"
+                (click)="showPassword.set(!showPassword())"
+                [attr.aria-label]="showPassword() ? 'Hide password' : 'Show password'"
+                class="absolute inset-y-0 right-0 flex w-9 items-center justify-center text-slate-500 hover:text-slate-800"
+              >
+                <mat-icon class="text-[18px]!">{{ showPassword() ? 'visibility_off' : 'visibility' }}</mat-icon>
+              </button>
+            </div>
           </div>
 
           <div class="sm:col-span-2 lg:col-span-3">
@@ -137,6 +152,7 @@ export class AdminManagement implements OnInit {
     'can_scan_qr',
   ]);
   protected readonly creating = signal(false);
+  protected readonly showPassword = signal(false);
 
   protected readonly createForm = this.fb.group({
     fullName: ['', Validators.required],

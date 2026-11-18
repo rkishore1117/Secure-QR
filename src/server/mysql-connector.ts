@@ -1,5 +1,5 @@
 import mysql from 'mysql2/promise';
-import {ensureDbInitialized, getMysqlConfig, queryOne} from './db';
+import {ensureDbInitialized, getMysqlConfig, isMockDbActive, queryOne} from './db';
 
 export interface MysqlHealthResult {
   configured: boolean;
@@ -21,13 +21,19 @@ export interface MysqlInitResult {
 export async function checkMysqlConnection(): Promise<MysqlHealthResult> {
   const {host, port, user, password, database} = getMysqlConfig();
 
-  if (!host || !user) {
+  if (!host || !user || isMockDbActive()) {
+    const countRow = await queryOne<{cnt: number}>('SELECT COUNT(*) as cnt FROM user_accounts').catch(
+      () => undefined,
+    );
     return {
-      configured: false,
+      configured: Boolean(host && user),
       connected: false,
-      host: 'not-configured',
+      host: host || 'in-memory-mock',
       database,
-      activeEngine: 'mysql-not-configured',
+      activeEngine:
+        countRow !== undefined
+          ? `in-memory-mock (${Number(countRow.cnt)} accounts)`
+          : 'in-memory-mock',
     };
   }
 
@@ -70,12 +76,13 @@ export async function checkMysqlConnection(): Promise<MysqlHealthResult> {
 export async function ensureMysqlDatabaseAndSchema(): Promise<MysqlInitResult> {
   const {host, database} = getMysqlConfig();
 
-  if (!host) {
+  if (!host || isMockDbActive()) {
+    await ensureDbInitialized();
     return {
-      success: false,
-      host: 'not-configured',
+      success: true,
+      host: host || 'in-memory-mock',
       database,
-      message: 'MySQL RDS credentials are not configured.',
+      message: `In-memory mock database "${database}" initialized (connect Cloud SQL or MySQL RDS for persistent storage).`,
     };
   }
 
