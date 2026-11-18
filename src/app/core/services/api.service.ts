@@ -301,6 +301,7 @@ export class ApiService {
         smtpConfigured: boolean;
         emailOtpConfigured: boolean;
         emailDeliveryMode?: string;
+        emailConfigSource?: string;
         smtpHost: string;
         smtpUser: string;
         dailyReportRecipient: string;
@@ -310,7 +311,40 @@ export class ApiService {
         filePath: string;
         fixedAdminEmail: string;
       };
+      emailSettings?: {
+        activeProvider: string;
+        configured: boolean;
+        configSource: string;
+        preferredProvider: string;
+        webhookUrl: string;
+        hasWebhookSecret: boolean;
+        hasBrevoKey: boolean;
+        hasResendKey: boolean;
+        resendFromEmail: string;
+        smtpHost: string;
+        smtpPort: number;
+        smtpUseTls: boolean;
+        smtpUser: string;
+        hasSmtpPassword: boolean;
+        defaultFromEmail: string;
+      };
     }>('/api/v1/admin/settings/db-status');
+  }
+
+  saveEmailConfig(payload: Record<string, unknown>) {
+    return this.http.post<{
+      success: boolean;
+      emailSettings: Record<string, unknown>;
+    }>('/api/v1/admin/settings/email', payload);
+  }
+
+  sendTestEmail(recipientEmail?: string) {
+    return this.http.post<{
+      success: boolean;
+      provider: string;
+      recipient: string;
+      error?: string;
+    }>('/api/v1/admin/settings/email/test', recipientEmail ? {recipientEmail} : {});
   }
 
   initMysqlDatabase() {

@@ -16,8 +16,11 @@ import {
 } from './db';
 import {buildVerifiedUsersWorkbook} from './excel';
 import {
-  getEmailDeliveryConfig,
+  EMAIL_SETTINGS_KEYS,
+  getEffectiveEmailDeliveryConfig,
+  getEmailSettingsMaskedSummary,
   sendDailyVerificationExcelReport,
+  sendTestEmail,
   sendVerificationOtpEmail,
 } from './mailer';
 import {checkMysqlConnection, ensureMysqlDatabaseAndSchema} from './mysql-connector';
@@ -2574,7 +2577,7 @@ export function createApiRouter(): express.Router {
     requirePermission('can_export_excel'),
     async (_req: AuthenticatedRequest, res: Response) => {
       const logs = await queryRows('SELECT * FROM scheduled_report_logs ORDER BY id DESC LIMIT 30');
-      const emailCfg = getEmailDeliveryConfig();
+      const emailCfg = await getEffectiveEmailDeliveryConfig();
       res.json({
         recipientEmail:
           getEnvValue('DAILY_REPORT_RECIPIENT_EMAIL') ||
@@ -2740,7 +2743,11 @@ export function createApiRouter(): express.Router {
       updated_at: Date | string;
     }>('SELECT `key` AS `key`, `value` AS `value`, updated_at FROM system_settings');
     const settings: Record<string, string> = {};
-    for (const s of settingsRows) settings[s.key] = s.value;
+    for (const s of settingsRows) {
+      if (!EMAIL_SETTINGS_KEYS.has(s.key)) {
+        settings[s.key] = s.value;
+      }
+    }
 
     const fieldConfigs = await queryRows<Record<string, unknown>>(
       'SELECT * FROM user_field_configs ORDER BY sort_order ASC, id ASC',
@@ -2762,7 +2769,8 @@ export function createApiRouter(): express.Router {
     async (_req: AuthenticatedRequest, res: Response) => {
       const mysqlStatus = await checkMysqlConnection();
       const cfg = getMysqlConfig();
-      const emailCfg = getEmailDeliveryConfig();
+      const emailCfg = await getEffectiveEmailDeliveryConfig();
+      const emailSummary = await getEmailSettingsMaskedSummary();
       res.json({
         database: {
           ...mysqlStatus,
@@ -2773,11 +2781,9 @@ export function createApiRouter(): express.Router {
           smtpConfigured: emailCfg.configured,
           emailOtpConfigured: emailCfg.configured,
           emailDeliveryMode: emailCfg.mode,
-          smtpHost: getEnvValue('EMAIL_HOST') || 'smtp.gmail.com',
-          smtpUser:
-            getEnvValue('DEFAULT_FROM_EMAIL') ||
-            getEnvValue('EMAIL_HOST_USER') ||
-            'kishore.sathayush@gmail.com',
+          emailConfigSource: emailCfg.configSource,
+          smtpHost: emailCfg.smtpHost,
+          smtpUser: emailCfg.defaultFromEmail || 'kishore.sathayush@gmail.com',
           dailyReportRecipient:
             getEnvValue('DAILY_REPORT_RECIPIENT_EMAIL') ||
             getEnvValue('FIXED_ADMIN_EMAIL') ||
@@ -2792,7 +2798,141 @@ export function createApiRouter(): express.Router {
           filePath: getEnvValue('FILE_PATH') || getEnvValue('File_path'),
           fixedAdminEmail: getEnvValue('FIXED_ADMIN_EMAIL') || 'kishore.sathayush@gmail.com',
         },
+        emailSettings: emailSummary,
       });
+    },
+  );
+
+  router.post(
+    '/admin/settings/email',
+    requireAuth,
+    requireSuperAdmin,
+    async (req: AuthenticatedRequest, res: Response) => {
+      const b = req.body || {};
+      const provider = String(b.provider || '').trim();
+      if (!['https-webhook', 'brevo-https', 'resend-https', 'gmail-smtp'].includes(provider)) {
+        res.status(400).json({error: 'Select a valid email delivery provider.'});
+        return;
+      }
+
+      const upsertSetting = async (key: string, value: string): Promise<void> => {
+        const nowMysql = toMysqlDateTime();
+        await executeSql(
+          `INSERT INTO system_settings (\`key\`, \`value\`, updated_at, updated_by)
+           VALUES (?, ?, ?, ?)
+           ON DUPLICATE KEY UPDATE \`value\` = VALUES(\`value\`), updated_at = VALUES(updated_at), updated_by = VALUES(updated_by)`,
+          [key, value, nowMysql, req.auth!.sub],
+        );
+      };
+
+      const defaultFromEmail = String(b.defaultFromEmail || '').trim();
+      if (defaultFromEmail && !/^\S+@\S+\.\S+$/.test(defaultFromEmail)) {
+        res.status(400).json({error: 'Enter a valid Default From Email address.'});
+        return;
+      }
+
+      if (provider === 'https-webhook') {
+        const webhookUrl = String(b.webhookUrl || '').trim();
+        if (!/^https?:\/\/\S+/i.test(webhookUrl)) {
+          res.status(400).json({error: 'Enter a valid https:// Apps Script Webhook URL.'});
+          return;
+        }
+        await upsertSetting('email_webhook_url', webhookUrl);
+        if (typeof b.webhookSecret === 'string' && b.webhookSecret.trim()) {
+          await upsertSetting('email_webhook_secret', b.webhookSecret.trim());
+        }
+      } else if (provider === 'brevo-https') {
+        const existing = await getEmailSettingsMaskedSummary();
+        const brevoApiKey = String(b.brevoApiKey || '').trim();
+        if (!brevoApiKey && !existing.hasBrevoKey) {
+          res.status(400).json({error: 'Enter your Brevo API Key.'});
+          return;
+        }
+        if (brevoApiKey) {
+          await upsertSetting('brevo_api_key', brevoApiKey);
+        }
+      } else if (provider === 'resend-https') {
+        const existing = await getEmailSettingsMaskedSummary();
+        const resendApiKey = String(b.resendApiKey || '').trim();
+        if (!resendApiKey && !existing.hasResendKey) {
+          res.status(400).json({error: 'Enter your Resend API Key.'});
+          return;
+        }
+        if (resendApiKey) {
+          await upsertSetting('resend_api_key', resendApiKey);
+        }
+        if (typeof b.resendFromEmail === 'string') {
+          await upsertSetting('resend_from_email', b.resendFromEmail.trim());
+        }
+      } else if (provider === 'gmail-smtp') {
+        const existing = await getEmailSettingsMaskedSummary();
+        const smtpHost = String(b.smtpHost || 'smtp.gmail.com').trim() || 'smtp.gmail.com';
+        const smtpPort = Number.parseInt(String(b.smtpPort || '587'), 10) || 587;
+        const smtpUseTls = b.smtpUseTls !== false ? 'True' : 'False';
+        const smtpUser = String(b.smtpUser || '').trim();
+        const smtpPassword = String(b.smtpPassword || '').trim();
+        if (!smtpUser) {
+          res.status(400).json({error: 'SMTP username / Gmail address is required.'});
+          return;
+        }
+        if (!smtpPassword && !existing.hasSmtpPassword) {
+          res.status(400).json({error: 'SMTP App Password is required.'});
+          return;
+        }
+        await upsertSetting('smtp_host', smtpHost);
+        await upsertSetting('smtp_port', String(smtpPort));
+        await upsertSetting('smtp_use_tls', smtpUseTls);
+        await upsertSetting('smtp_user', smtpUser);
+        if (smtpPassword) {
+          await upsertSetting('smtp_password', smtpPassword);
+        }
+      }
+
+      if (defaultFromEmail) {
+        await upsertSetting('default_from_email', defaultFromEmail);
+      }
+      await upsertSetting('email_preferred_provider', provider);
+
+      await writeAuditLog(
+        {id: req.auth!.sub, email: req.auth!.email, role: req.auth!.role},
+        'EMAIL_SETTINGS_UPDATED',
+        'SETTINGS',
+        'email_delivery',
+        {provider, defaultFromEmail: defaultFromEmail || null},
+        req.ip,
+      );
+
+      const summary = await getEmailSettingsMaskedSummary();
+      res.json({success: true, emailSettings: summary});
+    },
+  );
+
+  router.post(
+    '/admin/settings/email/test',
+    requireAuth,
+    requireSuperAdmin,
+    async (req: AuthenticatedRequest, res: Response) => {
+      const rawTarget = String(req.body?.recipientEmail || '').trim().toLowerCase();
+      const targetEmail =
+        rawTarget ||
+        getEnvValue('FIXED_ADMIN_EMAIL') ||
+        req.auth!.email;
+      if (!/^\S+@\S+\.\S+$/.test(targetEmail)) {
+        res.status(400).json({error: 'Enter a valid recipient email address for the test.'});
+        return;
+      }
+
+      const result = await sendTestEmail(targetEmail);
+      await writeAuditLog(
+        {id: req.auth!.sub, email: req.auth!.email, role: req.auth!.role},
+        'EMAIL_TEST_DISPATCHED',
+        'SETTINGS',
+        targetEmail,
+        {success: result.success, provider: result.provider, error: result.error || null},
+        req.ip,
+      );
+
+      res.json(result);
     },
   );
 
@@ -2822,6 +2962,7 @@ export function createApiRouter(): express.Router {
     }
     const nowMysql = toMysqlDateTime();
     for (const [k, v] of Object.entries(updates)) {
+      if (EMAIL_SETTINGS_KEYS.has(k)) continue;
       await executeSql(
         `INSERT INTO system_settings (\`key\`, \`value\`, updated_at, updated_by)
          VALUES (?, ?, ?, ?)

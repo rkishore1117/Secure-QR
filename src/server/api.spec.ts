@@ -334,6 +334,7 @@ describe('Secure QR Verification System — Crypto & API Integration', () => {
     expect(dbStatus.status).toBe(200);
     const dbInfo = dbStatus.data['database'] as Record<string, unknown>;
     const integrations = dbStatus.data['integrations'] as Record<string, unknown>;
+    const emailSettings = dbStatus.data['emailSettings'] as Record<string, unknown>;
     expect(dbInfo['connected']).toBe(true);
     expect(dbInfo['database']).toBe('secure_qr_verification');
     expect(integrations['fixedAdminEmail']).toBe('kishore.sathayush@gmail.com');
@@ -341,6 +342,24 @@ describe('Secure QR Verification System — Crypto & API Integration', () => {
     expect(integrations['smtpUser']).toBe('kishore.sathayush@gmail.com');
     expect(integrations['s3Configured']).toBe(true);
     expect(integrations['filePath']).toBe('https://sathayushstorage.s3.ap-south-1.amazonaws.com/sathayush/');
+    expect(emailSettings).toBeTruthy();
+    expect(typeof emailSettings['hasSmtpPassword']).toBe('boolean');
+    expect(emailSettings['smtpPassword']).toBeUndefined();
+
+    const sysSettings = await requestJson(baseUrl, '/api/v1/admin/settings', {
+      headers: {Authorization: `Bearer ${fixedToken}`},
+    });
+    expect(sysSettings.status).toBe(200);
+    const settingsObj = sysSettings.data['settings'] as Record<string, string>;
+    expect(settingsObj['smtp_password']).toBeUndefined();
+    expect(settingsObj['brevo_api_key']).toBeUndefined();
+
+    const badEmailProvider = await requestJson(baseUrl, '/api/v1/admin/settings/email', {
+      method: 'POST',
+      headers: {Authorization: `Bearer ${fixedToken}`},
+      body: JSON.stringify({provider: 'invalid-provider'}),
+    });
+    expect(badEmailProvider.status).toBe(400);
 
     const initMysql = await requestJson(baseUrl, '/api/v1/admin/settings/init-mysql', {
       method: 'POST',

@@ -14,7 +14,7 @@ import {ToastService} from '../../core/services/toast.service';
       <div>
         <h1 class="fluid-page-title font-bold text-[#0F172A] font-display">System Settings &amp; Dynamic Fields</h1>
         <p class="mt-1 text-sm text-slate-600">
-          Configure QR credential validity, OTP expiration, organization identity, and dynamic registration form fields.
+          Configure QR credential validity, OTP expiration, organization identity, email delivery gateways, and dynamic registration form fields.
         </p>
       </div>
 
@@ -59,6 +59,186 @@ import {ToastService} from '../../core/services/toast.service';
             >
               <mat-icon class="text-[18px]!">save</mat-icon>
               <span>Save Settings</span>
+            </button>
+          </div>
+        </form>
+      </section>
+
+      <!-- Runtime Email Delivery Configuration (Before & After Publish) -->
+      <section class="rounded-xl border border-slate-200 bg-white p-5 sm:p-6 space-y-4">
+        <div class="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h2 class="text-sm font-bold text-[#0F172A] font-display">Email Delivery Gateway (OTP &amp; 24h Excel Reports)</h2>
+            <p class="mt-0.5 text-xs text-slate-600">
+              Configure email delivery here so published environments work even when <code class="font-mono text-[11px]">.env</code> is not present. Use an HTTPS gateway on Render Free or Cloud Run.
+            </p>
+          </div>
+          @if (integrationStatus(); as st) {
+            <span
+              class="rounded-md px-2.5 py-1 font-mono text-[11px] font-semibold"
+              [class.bg-emerald-50]="st.integrations.emailOtpConfigured"
+              [class.text-emerald-800]="st.integrations.emailOtpConfigured"
+              [class.bg-amber-50]="!st.integrations.emailOtpConfigured"
+              [class.text-amber-800]="!st.integrations.emailOtpConfigured"
+            >
+              {{
+                st.integrations.emailOtpConfigured
+                  ? 'Active: ' + (st.integrations.emailDeliveryMode || 'configured') + ' (' + (st.integrations.emailConfigSource || 'env') + ')'
+                  : 'Not Configured'
+              }}
+            </span>
+          }
+        </div>
+
+        <form [formGroup]="emailForm" (ngSubmit)="saveEmailConfig()" class="grid grid-cols-1 gap-4 sm:grid-cols-2">
+          <div>
+            <label for="em-provider" class="block text-xs font-semibold text-slate-700 mb-1">Delivery Provider</label>
+            <select id="em-provider" formControlName="provider" class="w-full h-10 rounded-lg border border-slate-300 bg-white px-3 text-xs">
+              <option value="https-webhook">Google Apps Script HTTPS Webhook (Recommended for Render/Cloud)</option>
+              <option value="brevo-https">Brevo HTTPS API (Port 443)</option>
+              <option value="resend-https">Resend HTTPS API (Port 443)</option>
+              <option value="gmail-smtp">Gmail / Custom SMTP (Ports 587 / 465)</option>
+            </select>
+          </div>
+
+          <div>
+            <label for="em-from" class="block text-xs font-semibold text-slate-700 mb-1">Default From Email</label>
+            <input
+              id="em-from"
+              type="email"
+              formControlName="defaultFromEmail"
+              placeholder="kishore.sathayush@gmail.com"
+              class="w-full h-10 rounded-lg border border-slate-300 px-3 text-xs"
+            />
+          </div>
+
+          @if (emailForm.value.provider === 'https-webhook') {
+            <div class="sm:col-span-2">
+              <label for="em-webhook-url" class="block text-xs font-semibold text-slate-700 mb-1">
+                Apps Script / Relay Webhook URL (https://...)
+              </label>
+              <input
+                id="em-webhook-url"
+                type="url"
+                formControlName="webhookUrl"
+                placeholder="https://script.google.com/macros/s/.../exec"
+                class="w-full h-10 rounded-lg border border-slate-300 px-3 font-mono text-xs"
+              />
+            </div>
+            <div class="sm:col-span-2">
+              <label for="em-webhook-sec" class="block text-xs font-semibold text-slate-700 mb-1">
+                Webhook Secret {{ integrationStatus()?.emailSettings?.hasWebhookSecret ? '(Saved — leave blank to keep existing)' : '(Optional)' }}
+              </label>
+              <input
+                id="em-webhook-sec"
+                type="password"
+                formControlName="webhookSecret"
+                autocomplete="new-password"
+                placeholder="Shared secret token checked by Apps Script"
+                class="w-full h-10 rounded-lg border border-slate-300 px-3 text-xs"
+              />
+            </div>
+          }
+
+          @if (emailForm.value.provider === 'brevo-https') {
+            <div class="sm:col-span-2">
+              <label for="em-brevo-key" class="block text-xs font-semibold text-slate-700 mb-1">
+                Brevo API Key {{ integrationStatus()?.emailSettings?.hasBrevoKey ? '(Saved — leave blank to keep existing)' : '' }}
+              </label>
+              <input
+                id="em-brevo-key"
+                type="password"
+                formControlName="brevoApiKey"
+                autocomplete="new-password"
+                placeholder="xkeysib-..."
+                class="w-full h-10 rounded-lg border border-slate-300 px-3 font-mono text-xs"
+              />
+            </div>
+          }
+
+          @if (emailForm.value.provider === 'resend-https') {
+            <div>
+              <label for="em-resend-key" class="block text-xs font-semibold text-slate-700 mb-1">
+                Resend API Key {{ integrationStatus()?.emailSettings?.hasResendKey ? '(Saved — leave blank to keep existing)' : '' }}
+              </label>
+              <input
+                id="em-resend-key"
+                type="password"
+                formControlName="resendApiKey"
+                autocomplete="new-password"
+                placeholder="re_..."
+                class="w-full h-10 rounded-lg border border-slate-300 px-3 font-mono text-xs"
+              />
+            </div>
+            <div>
+              <label for="em-resend-from" class="block text-xs font-semibold text-slate-700 mb-1">
+                Verified Sender Header (Optional)
+              </label>
+              <input
+                id="em-resend-from"
+                type="text"
+                formControlName="resendFromEmail"
+                placeholder="Secure QR <noreply@yourdomain.com>"
+                class="w-full h-10 rounded-lg border border-slate-300 px-3 text-xs"
+              />
+            </div>
+          }
+
+          @if (emailForm.value.provider === 'gmail-smtp') {
+            <div>
+              <label for="em-smtp-host" class="block text-xs font-semibold text-slate-700 mb-1">SMTP Host</label>
+              <input id="em-smtp-host" type="text" formControlName="smtpHost" class="w-full h-10 rounded-lg border border-slate-300 px-3 font-mono text-xs" />
+            </div>
+            <div>
+              <label for="em-smtp-port" class="block text-xs font-semibold text-slate-700 mb-1">SMTP Port</label>
+              <input id="em-smtp-port" type="number" formControlName="smtpPort" class="w-full h-10 rounded-lg border border-slate-300 px-3 font-mono text-xs" />
+            </div>
+            <div>
+              <label for="em-smtp-user" class="block text-xs font-semibold text-slate-700 mb-1">SMTP Username / Gmail Address</label>
+              <input id="em-smtp-user" type="email" formControlName="smtpUser" placeholder="kishore.sathayush@gmail.com" class="w-full h-10 rounded-lg border border-slate-300 px-3 text-xs" />
+            </div>
+            <div>
+              <label for="em-smtp-pass" class="block text-xs font-semibold text-slate-700 mb-1">
+                Gmail App Password {{ integrationStatus()?.emailSettings?.hasSmtpPassword ? '(Saved — leave blank to keep existing)' : '' }}
+              </label>
+              <input
+                id="em-smtp-pass"
+                type="password"
+                formControlName="smtpPassword"
+                autocomplete="new-password"
+                placeholder="16-character Google App Password"
+                class="w-full h-10 rounded-lg border border-slate-300 px-3 text-xs"
+              />
+            </div>
+          }
+
+          <div class="sm:col-span-2 flex flex-col gap-3 border-t border-slate-100 pt-3 sm:flex-row sm:items-center sm:justify-between">
+            <div class="flex flex-1 flex-col gap-2 sm:flex-row sm:items-center">
+              <input
+                type="email"
+                formControlName="testRecipient"
+                placeholder="Test recipient email (optional)"
+                aria-label="Test email recipient"
+                class="h-10 w-full sm:max-w-xs rounded-lg border border-slate-300 px-3 text-xs"
+              />
+              <button
+                type="button"
+                (click)="sendTestEmail()"
+                [disabled]="testingEmail()"
+                class="touch-target inline-flex items-center justify-center gap-1.5 rounded-lg border border-slate-300 bg-slate-50 px-4 py-2 text-xs font-semibold text-[#0F172A] hover:bg-slate-100 disabled:opacity-50 whitespace-nowrap"
+              >
+                <mat-icon class="text-[18px]!">send</mat-icon>
+                <span>{{ testingEmail() ? 'Sending Test...' : 'Send Test Email' }}</span>
+              </button>
+            </div>
+
+            <button
+              type="submit"
+              [disabled]="savingEmail()"
+              class="touch-target inline-flex items-center justify-center gap-2 rounded-lg bg-[#0F172A] px-5 py-2.5 text-xs font-semibold text-white hover:bg-[#1E3A5F] disabled:opacity-50 whitespace-nowrap"
+            >
+              <mat-icon class="text-[18px]!">save</mat-icon>
+              <span>{{ savingEmail() ? 'Saving...' : 'Save Email Gateway' }}</span>
             </button>
           </div>
         </form>
@@ -163,7 +343,7 @@ import {ToastService} from '../../core/services/toast.service';
               <div class="flex items-start justify-between gap-2">
                 <div>
                   <p class="font-semibold text-[#0F172A]">Separate Secure QR Database (MySQL RDS)</p>
-                  <p class="mt-0.5 font-mono text-slate-600 break-all">{{ status.database.host }} / {{ status.database.database }}</p>
+                  <p class="mt-0.5 font-mono text-slate-600 break-all">{{ status.database.host || 'Not Set (Mock Fallback)' }} / {{ status.database.database }}</p>
                 </div>
                 <button
                   type="button"
@@ -175,30 +355,30 @@ import {ToastService} from '../../core/services/toast.service';
                 </button>
               </div>
               <p [class.text-emerald-700]="status.database.connected" [class.text-amber-700]="!status.database.connected" class="font-semibold">
-                {{ status.database.connected ? 'Connected to ' + status.database.database + ' (' + status.database.activeEngine + ')' : 'MySQL RDS unavailable — ' + (status.database.error || 'check host/credentials') }}
+                {{ status.database.connected ? 'Connected to ' + status.database.database + ' (' + status.database.activeEngine + ')' : 'MySQL RDS unavailable — ' + (status.database.error || 'set DB_HOST/DB_USER/DB_PASSWORD in environment') }}
               </p>
             </div>
 
             <div class="rounded-lg border border-slate-200 bg-slate-50 p-4 text-xs space-y-1">
               <p class="font-semibold text-[#0F172A]">24-Hour Automated Excel Email</p>
-              <p class="font-mono text-slate-600 break-all">{{ status.integrations.smtpHost }} ({{ status.integrations.smtpUser || 'Unset' }})</p>
+              <p class="font-mono text-slate-600 break-all">{{ status.integrations.emailDeliveryMode || status.integrations.smtpHost }} ({{ status.integrations.smtpUser || 'Unset' }})</p>
               <p class="text-slate-700">Daily summary sent to: <span class="font-mono font-semibold">{{ status.integrations.dailyReportRecipient }}</span></p>
             </div>
 
             <div class="rounded-lg border border-slate-200 bg-slate-50 p-4 text-xs space-y-1">
               <p class="font-semibold text-[#0F172A]">Email OTP Verification</p>
               <p class="font-mono text-slate-600 break-all">
-                Sender: {{ status.integrations.smtpUser || 'Not Set' }} · Mode: {{ status.integrations.emailDeliveryMode || status.integrations.smtpHost }}
+                Sender: {{ status.integrations.smtpUser || 'Not Set' }} · Mode: {{ status.integrations.emailDeliveryMode || 'console' }}
               </p>
-              <p [class.text-emerald-700]="status.integrations.emailOtpConfigured" [class.text-slate-600]="!status.integrations.emailOtpConfigured" class="font-semibold">
-                {{ status.integrations.emailOtpConfigured ? 'Active (Registration OTP Emails Enabled)' : 'Email Credentials Missing' }}
+              <p [class.text-emerald-700]="status.integrations.emailOtpConfigured" [class.text-amber-700]="!status.integrations.emailOtpConfigured" class="font-semibold">
+                {{ status.integrations.emailOtpConfigured ? 'Active (Registration & Reset OTP Emails Enabled)' : 'Email Provider Not Configured — Set Gateway Above' }}
               </p>
             </div>
 
             <div class="rounded-lg border border-slate-200 bg-slate-50 p-4 text-xs space-y-1">
               <p class="font-semibold text-[#0F172A]">AWS S3 Image &amp; Document Storage</p>
               <p class="font-mono text-slate-600 break-all">{{ status.integrations.s3Bucket || 'Local' }} ({{ status.integrations.s3Region || 'local' }})</p>
-              <p class="font-mono text-[11px] text-slate-500 break-all">{{ status.integrations.filePath }}</p>
+              <p class="font-mono text-[11px] text-slate-500 break-all">{{ status.integrations.filePath || 'Local /api/v1/uploads/' }}</p>
             </div>
           </div>
         </section>
@@ -214,20 +394,40 @@ export class AdminSettings implements OnInit {
   protected readonly Number = Number;
   protected readonly fieldConfigs = signal<Record<string, unknown>[]>([]);
   protected readonly initializingDb = signal(false);
+  protected readonly savingEmail = signal(false);
+  protected readonly testingEmail = signal(false);
   protected readonly integrationStatus = signal<{
     database: {configured: boolean; connected: boolean; host: string; database: string; activeEngine: string; error?: string};
-      integrations: {
-        smtpConfigured: boolean;
-        emailOtpConfigured: boolean;
-        emailDeliveryMode?: string;
-        smtpHost: string;
-        smtpUser: string;
+    integrations: {
+      smtpConfigured: boolean;
+      emailOtpConfigured: boolean;
+      emailDeliveryMode?: string;
+      emailConfigSource?: string;
+      smtpHost: string;
+      smtpUser: string;
       dailyReportRecipient: string;
       s3Configured: boolean;
       s3Bucket: string;
       s3Region: string;
       filePath: string;
       fixedAdminEmail: string;
+    };
+    emailSettings?: {
+      activeProvider: string;
+      configured: boolean;
+      configSource: string;
+      preferredProvider: string;
+      webhookUrl: string;
+      hasWebhookSecret: boolean;
+      hasBrevoKey: boolean;
+      hasResendKey: boolean;
+      resendFromEmail: string;
+      smtpHost: string;
+      smtpPort: number;
+      smtpUseTls: boolean;
+      smtpUser: string;
+      hasSmtpPassword: boolean;
+      defaultFromEmail: string;
     };
   } | null>(null);
 
@@ -238,6 +438,21 @@ export class AdminSettings implements OnInit {
     max_otp_attempts: ['5'],
     id_proof_required: ['true'],
     allow_multiple_active_qr: ['false'],
+  });
+
+  protected readonly emailForm = this.fb.group({
+    provider: ['https-webhook'],
+    defaultFromEmail: ['kishore.sathayush@gmail.com'],
+    webhookUrl: [''],
+    webhookSecret: [''],
+    brevoApiKey: [''],
+    resendApiKey: [''],
+    resendFromEmail: [''],
+    smtpHost: ['smtp.gmail.com'],
+    smtpPort: [587],
+    smtpUser: [''],
+    smtpPassword: [''],
+    testRecipient: [''],
   });
 
   protected readonly fieldForm = this.fb.group({
@@ -260,12 +475,85 @@ export class AdminSettings implements OnInit {
       try {
         const status = await firstValueFrom(this.api.getIntegrationStatus());
         this.integrationStatus.set(status);
+        if (status.emailSettings) {
+          const es = status.emailSettings;
+          const selectedProvider =
+            es.preferredProvider && es.preferredProvider !== 'console'
+              ? es.preferredProvider
+              : es.activeProvider !== 'console'
+                ? es.activeProvider
+                : 'https-webhook';
+          this.emailForm.patchValue({
+            provider: selectedProvider,
+            defaultFromEmail: es.defaultFromEmail || 'kishore.sathayush@gmail.com',
+            webhookUrl: es.webhookUrl || '',
+            resendFromEmail: es.resendFromEmail || '',
+            smtpHost: es.smtpHost || 'smtp.gmail.com',
+            smtpPort: es.smtpPort || 587,
+            smtpUser: es.smtpUser || '',
+            testRecipient: this.emailForm.value.testRecipient || status.integrations.fixedAdminEmail,
+          });
+        }
       } catch {
         // optional integration status check
       }
     } catch (err: unknown) {
       const msg = (err as {error?: {error?: string}})?.error?.error || 'Could not load system settings.';
       this.toast.error('Load Failed', msg);
+    }
+  }
+
+  async saveEmailConfig(): Promise<void> {
+    this.savingEmail.set(true);
+    try {
+      const v = this.emailForm.value;
+      await firstValueFrom(
+        this.api.saveEmailConfig({
+          provider: v.provider,
+          defaultFromEmail: v.defaultFromEmail,
+          webhookUrl: v.webhookUrl,
+          webhookSecret: v.webhookSecret,
+          brevoApiKey: v.brevoApiKey,
+          resendApiKey: v.resendApiKey,
+          resendFromEmail: v.resendFromEmail,
+          smtpHost: v.smtpHost,
+          smtpPort: v.smtpPort,
+          smtpUseTls: true,
+          smtpUser: v.smtpUser,
+          smtpPassword: v.smtpPassword,
+        }),
+      );
+      this.emailForm.patchValue({
+        webhookSecret: '',
+        brevoApiKey: '',
+        resendApiKey: '',
+        smtpPassword: '',
+      });
+      this.toast.success('Email Gateway Saved', 'Email delivery configuration updated.');
+      await this.load();
+    } catch (err: unknown) {
+      const msg = (err as {error?: {error?: string}})?.error?.error || 'Could not save email gateway.';
+      this.toast.error('Save Failed', msg);
+    } finally {
+      this.savingEmail.set(false);
+    }
+  }
+
+  async sendTestEmail(): Promise<void> {
+    this.testingEmail.set(true);
+    try {
+      const target = String(this.emailForm.value.testRecipient || '').trim();
+      const res = await firstValueFrom(this.api.sendTestEmail(target || undefined));
+      if (res.success) {
+        this.toast.success('Test Email Sent', `Delivered to ${res.recipient} via ${res.provider}.`);
+      } else {
+        this.toast.error('Test Email Failed', res.error || 'Email delivery failed.');
+      }
+    } catch (err: unknown) {
+      const msg = (err as {error?: {error?: string}})?.error?.error || 'Unable to dispatch test email.';
+      this.toast.error('Test Error', msg);
+    } finally {
+      this.testingEmail.set(false);
     }
   }
 
