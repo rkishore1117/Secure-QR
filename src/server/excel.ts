@@ -1,5 +1,5 @@
 import ExcelJS from 'exceljs';
-import {getDb} from './db';
+import {queryRows, toIsoString, toMysqlDateTime} from './db';
 
 export interface ExcelFilterOptions {
   status?: string;
@@ -26,36 +26,34 @@ export async function buildVerifiedUsersWorkbook(
     params.push(status);
   }
   if (state) {
-    where.push('lower(ur.state) = lower(?)');
+    where.push('LOWER(ur.state) = LOWER(?)');
     params.push(state);
   }
   if (city) {
-    where.push('lower(ur.city) = lower(?)');
+    where.push('LOWER(ur.city) = LOWER(?)');
     params.push(city);
   }
   if (dateFrom) {
     where.push('ur.created_at >= ?');
-    params.push(dateFrom);
+    params.push(toMysqlDateTime(`${dateFrom}T00:00:00.000Z`));
   }
   if (dateTo) {
     where.push('ur.created_at <= ?');
-    params.push(`${dateTo}T23:59:59.999Z`);
+    params.push(toMysqlDateTime(`${dateTo}T23:59:59.999Z`));
   }
 
-  const db = getDb();
-  const rows = db
-    .prepare(
-      `SELECT ua.id as user_id, ur.registration_id, ur.full_name, ua.mobile, ua.email,
-              ur.address, ur.city, ur.district, ur.state, ur.country, ur.created_at, ur.approval_status,
-              (SELECT status FROM qr_codes q WHERE q.user_record_id = ur.id ORDER BY q.id DESC LIMIT 1) as qr_status,
-              (SELECT expires_at FROM qr_codes q WHERE q.user_record_id = ur.id ORDER BY q.id DESC LIMIT 1) as qr_validity,
-              (SELECT last_verified_at FROM qr_codes q WHERE q.user_record_id = ur.id ORDER BY q.id DESC LIMIT 1) as last_verified_at
-       FROM user_records ur
-       JOIN user_accounts ua ON ua.id = ur.user_id
-       WHERE ${where.join(' AND ')}
-       ORDER BY ur.created_at DESC`,
-    )
-    .all(...params) as Record<string, unknown>[];
+  const rows = await queryRows<Record<string, unknown>>(
+    `SELECT ua.id as user_id, ur.registration_id, ur.full_name, ua.mobile, ua.email,
+            ur.address, ur.city, ur.district, ur.state, ur.country, ur.created_at, ur.approval_status,
+            (SELECT status FROM qr_codes q WHERE q.user_record_id = ur.id ORDER BY q.id DESC LIMIT 1) as qr_status,
+            (SELECT expires_at FROM qr_codes q WHERE q.user_record_id = ur.id ORDER BY q.id DESC LIMIT 1) as qr_validity,
+            (SELECT last_verified_at FROM qr_codes q WHERE q.user_record_id = ur.id ORDER BY q.id DESC LIMIT 1) as last_verified_at
+     FROM user_records ur
+     JOIN user_accounts ua ON ua.id = ur.user_id
+     WHERE ${where.join(' AND ')}
+     ORDER BY ur.created_at DESC`,
+    params,
+  );
 
   const workbook = new ExcelJS.Workbook();
   workbook.creator = 'Secure QR Verification System';
@@ -91,6 +89,9 @@ export async function buildVerifiedUsersWorkbook(
   headerRow.height = 26;
 
   rows.forEach((r, idx) => {
+    const createdIso = toIsoString(r['created_at']);
+    const validityIso = toIsoString(r['qr_validity']);
+    const verifiedIso = toIsoString(r['last_verified_at']);
     const added = sheet.addRow({
       serial: idx + 1,
       userId: r['user_id'],
@@ -103,13 +104,11 @@ export async function buildVerifiedUsersWorkbook(
       district: r['district'],
       state: r['state'],
       country: r['country'],
-      registrationDate: String(r['created_at'] || '').slice(0, 19).replace('T', ' '),
+      registrationDate: createdIso.slice(0, 19).replace('T', ' '),
       approvalStatus: r['approval_status'],
       qrStatus: r['qr_status'] || 'NOT_ISSUED',
-      qrValidity: r['qr_validity'] ? String(r['qr_validity']).slice(0, 10) : 'N/A',
-      lastVerifiedDate: r['last_verified_at']
-        ? String(r['last_verified_at']).slice(0, 19).replace('T', ' ')
-        : 'Never',
+      qrValidity: validityIso ? validityIso.slice(0, 10) : 'N/A',
+      lastVerifiedDate: verifiedIso ? verifiedIso.slice(0, 19).replace('T', ' ') : 'Never',
     });
     added.height = 20;
   });

@@ -75,7 +75,8 @@ class RegistrationRequest(models.Model):
 
 
 class OTPVerification(models.Model):
-    mobile = models.CharField(max_length=20, db_index=True)
+    email = models.EmailField(db_index=True, null=True, blank=True)
+    mobile = models.CharField(max_length=20, blank=True, default="", db_index=True)
     purpose = models.CharField(max_length=32, default="REGISTRATION")
     otp_hash = models.CharField(max_length=64)
     expires_at = models.DateTimeField()

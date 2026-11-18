@@ -1,6 +1,6 @@
-import type {DatabaseSync as DatabaseSyncType} from 'node:sqlite';
 import fs from 'node:fs';
 import path from 'node:path';
+import mysql from 'mysql2/promise';
 import QRCode from 'qrcode';
 import {
   generateSecureQrToken,
@@ -8,299 +8,434 @@ import {
   sha256Hex,
 } from './crypto';
 
-const sqliteMod = (process as unknown as {getBuiltinModule: (id: string) => {DatabaseSync: new (loc: string) => DatabaseSyncType}})
-  .getBuiltinModule('node:sqlite');
-const DatabaseSync = sqliteMod.DatabaseSync;
-
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
-const DB_PATH = path.join(DATA_DIR, 'secure_qr.db');
 
-let dbInstance: DatabaseSyncType | null = null;
+function loadEnvSafe(): void {
+  try {
+    (process as unknown as {loadEnvFile?: () => void}).loadEnvFile?.();
+  } catch {
+    // .env may not exist in all environments
+  }
+}
+
+export function sanitizeDbName(name: string): string {
+  const cleaned = name.replace(/[^a-zA-Z0-9_]/g, '');
+  return cleaned || 'secure_qr_verification';
+}
+
+export function getMysqlConfig() {
+  loadEnvSafe();
+  const host = (process.env['DB_HOST'] || '').trim();
+  const port = Number.parseInt(process.env['DB_PORT'] || '3306', 10) || 3306;
+  const user = (process.env['DB_USER'] || '').trim();
+  const password = process.env['DB_PASSWORD'] || '';
+  const database = sanitizeDbName(process.env['DB_NAME'] || 'secure_qr_verification');
+  return {host, port, user, password, database};
+}
 
 export function getUploadsDir(): string {
   fs.mkdirSync(UPLOADS_DIR, {recursive: true});
   return UPLOADS_DIR;
 }
 
-export function getDb(): DatabaseSyncType {
-  if (dbInstance) return dbInstance;
-  fs.mkdirSync(DATA_DIR, {recursive: true});
-  fs.mkdirSync(UPLOADS_DIR, {recursive: true});
-
-  const db = new DatabaseSync(DB_PATH);
-  db.exec('PRAGMA journal_mode = WAL;');
-  db.exec('PRAGMA foreign_keys = ON;');
-
-  createSchema(db);
-  dbInstance = db;
-  return db;
+export function toMysqlDateTime(input?: Date | string | number): string {
+  const d = input instanceof Date ? input : input !== undefined ? new Date(input) : new Date();
+  const valid = Number.isNaN(d.getTime()) ? new Date() : d;
+  return valid.toISOString().slice(0, 23).replace('T', ' ');
 }
 
-export function withTransaction<T>(fn: (db: DatabaseSyncType) => T): T {
-  const db = getDb();
-  db.exec('BEGIN IMMEDIATE;');
+export function toIsoString(input: unknown): string {
+  if (!input) return '';
+  if (input instanceof Date) return input.toISOString();
+  return String(input);
+}
+
+export function parseJsonSafe<T>(val: unknown, fallback: T): T {
+  if (val === null || val === undefined || val === '') return fallback;
+  if (typeof val === 'string') {
+    try {
+      return JSON.parse(val) as T;
+    } catch {
+      return fallback;
+    }
+  }
+  return val as T;
+}
+
+let poolInstance: mysql.Pool | null = null;
+let initPromise: Promise<void> | null = null;
+let seeded = false;
+let seedingPromise: Promise<void> | null = null;
+
+export function getPool(): mysql.Pool {
+  if (poolInstance) return poolInstance;
+  const cfg = getMysqlConfig();
+  if (!cfg.host || !cfg.user) {
+    throw new Error(
+      'MySQL RDS configuration is missing (DB_HOST / DB_USER). Configure .env before starting the server.',
+    );
+  }
+  poolInstance = mysql.createPool({
+    host: cfg.host,
+    port: cfg.port,
+    user: cfg.user,
+    password: cfg.password,
+    database: cfg.database,
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0,
+    timezone: 'Z',
+    connectTimeout: 8000,
+  });
+  return poolInstance;
+}
+
+export async function queryRows<T = Record<string, unknown>>(
+  sql: string,
+  params: unknown[] = [],
+): Promise<T[]> {
+  const [rows] = await getPool().query(sql, params);
+  return rows as T[];
+}
+
+export async function queryOne<T = Record<string, unknown>>(
+  sql: string,
+  params: unknown[] = [],
+): Promise<T | undefined> {
+  const rows = await queryRows<T>(sql, params);
+  return rows[0];
+}
+
+export async function executeSql(
+  sql: string,
+  params: unknown[] = [],
+): Promise<mysql.ResultSetHeader> {
+  const [res] = await getPool().query(sql, params);
+  return res as mysql.ResultSetHeader;
+}
+
+export interface TxClient {
+  queryRows<T = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<T[]>;
+  queryOne<T = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<T | undefined>;
+  executeSql(sql: string, params?: unknown[]): Promise<mysql.ResultSetHeader>;
+}
+
+export async function withTransaction<T>(fn: (tx: TxClient) => Promise<T>): Promise<T> {
+  const conn = await getPool().getConnection();
+  await conn.beginTransaction();
+  const tx: TxClient = {
+    async queryRows<R = Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<R[]> {
+      const [rows] = await conn.query(sql, params);
+      return rows as R[];
+    },
+    async queryOne<R = Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<R | undefined> {
+      const [rows] = await conn.query(sql, params);
+      return (rows as R[])[0];
+    },
+    async executeSql(sql: string, params: unknown[] = []): Promise<mysql.ResultSetHeader> {
+      const [res] = await conn.query(sql, params);
+      return res as mysql.ResultSetHeader;
+    },
+  };
+
   try {
-    const result = fn(db);
-    db.exec('COMMIT;');
+    const result = await fn(tx);
+    await conn.commit();
     return result;
   } catch (err) {
-    db.exec('ROLLBACK;');
+    await conn.rollback();
     throw err;
+  } finally {
+    conn.release();
   }
 }
 
-function createSchema(db: DatabaseSyncType): void {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS roles (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL UNIQUE,
-      description TEXT NOT NULL
-    );
+export const MYSQL_DDL_STATEMENTS: string[] = [
+  `CREATE TABLE IF NOT EXISTS roles (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(32) NOT NULL UNIQUE,
+    description TEXT NOT NULL
+  ) ENGINE=InnoDB;`,
+  `CREATE TABLE IF NOT EXISTS permissions (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    code VARCHAR(64) NOT NULL UNIQUE,
+    label VARCHAR(128) NOT NULL,
+    description TEXT NOT NULL
+  ) ENGINE=InnoDB;`,
+  `CREATE TABLE IF NOT EXISTS role_permissions (
+    role_id BIGINT NOT NULL,
+    permission_code VARCHAR(64) NOT NULL,
+    PRIMARY KEY (role_id, permission_code),
+    CONSTRAINT fk_rp_role FOREIGN KEY (role_id) REFERENCES roles(id) ON DELETE CASCADE
+  ) ENGINE=InnoDB;`,
+  `CREATE TABLE IF NOT EXISTS user_accounts (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    email VARCHAR(255) NOT NULL UNIQUE,
+    mobile VARCHAR(20) NOT NULL UNIQUE,
+    password_hash VARCHAR(255) NOT NULL,
+    role ENUM('SUPER_ADMIN', 'ADMIN', 'USER') NOT NULL DEFAULT 'USER',
+    is_active TINYINT(1) NOT NULL DEFAULT 1,
+    is_mobile_verified TINYINT(1) NOT NULL DEFAULT 0,
+    is_email_verified TINYINT(1) NOT NULL DEFAULT 0,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+    deleted_at DATETIME(6) NULL,
+    INDEX idx_user_accounts_role (role),
+    INDEX idx_user_accounts_mobile (mobile)
+  ) ENGINE=InnoDB;`,
+  `CREATE TABLE IF NOT EXISTS admin_profiles (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    user_id BIGINT NOT NULL UNIQUE,
+    full_name VARCHAR(150) NOT NULL,
+    department VARCHAR(120) NOT NULL DEFAULT 'Verification Operations',
+    designation VARCHAR(120) NOT NULL DEFAULT 'Compliance Officer',
+    avatar_url VARCHAR(500) NOT NULL DEFAULT '/assets/images/avatar_admin_portrait_1794911291825.jpg',
+    permissions_json JSON NOT NULL,
+    created_by BIGINT NULL,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    CONSTRAINT fk_admin_user FOREIGN KEY (user_id) REFERENCES user_accounts(id) ON DELETE CASCADE
+  ) ENGINE=InnoDB;`,
+  `CREATE TABLE IF NOT EXISTS user_records (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    user_id BIGINT NOT NULL UNIQUE,
+    registration_id VARCHAR(32) NOT NULL UNIQUE,
+    full_name VARCHAR(160) NOT NULL,
+    dob DATE NULL,
+    gender VARCHAR(32) NULL,
+    address TEXT NOT NULL,
+    city VARCHAR(100) NOT NULL,
+    district VARCHAR(100) NOT NULL,
+    state VARCHAR(100) NOT NULL,
+    country VARCHAR(100) NOT NULL,
+    postal_code VARCHAR(24) NOT NULL,
+    profile_photo_url VARCHAR(500) NOT NULL,
+    id_proof_type VARCHAR(64) NOT NULL DEFAULT 'National ID',
+    id_proof_url VARCHAR(500) NULL,
+    dynamic_fields_json JSON NOT NULL,
+    consent_accepted TINYINT(1) NOT NULL DEFAULT 1,
+    consent_timestamp DATETIME(6) NOT NULL,
+    approval_status ENUM('PENDING', 'APPROVED', 'REJECTED', 'RESUBMISSION_REQUIRED') NOT NULL DEFAULT 'PENDING',
+    rejection_reason TEXT NULL,
+    resubmission_note TEXT NULL,
+    reviewed_by BIGINT NULL,
+    reviewed_at DATETIME(6) NULL,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+    deleted_at DATETIME(6) NULL,
+    INDEX idx_ur_status (approval_status),
+    INDEX idx_ur_state_city (state, city),
+    CONSTRAINT fk_ur_user FOREIGN KEY (user_id) REFERENCES user_accounts(id) ON DELETE CASCADE
+  ) ENGINE=InnoDB;`,
+  `CREATE TABLE IF NOT EXISTS registration_requests (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    user_record_id BIGINT NOT NULL,
+    request_type ENUM('INITIAL', 'RESUBMISSION') NOT NULL DEFAULT 'INITIAL',
+    status ENUM('PENDING', 'APPROVED', 'REJECTED', 'RESUBMISSION_REQUIRED') NOT NULL,
+    notes TEXT NULL,
+    submitted_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    processed_by BIGINT NULL,
+    processed_at DATETIME(6) NULL,
+    CONSTRAINT fk_rr_record FOREIGN KEY (user_record_id) REFERENCES user_records(id) ON DELETE CASCADE
+  ) ENGINE=InnoDB;`,
+  `CREATE TABLE IF NOT EXISTS otp_verifications (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    email VARCHAR(255) NULL,
+    mobile VARCHAR(20) NULL DEFAULT '',
+    purpose VARCHAR(32) NOT NULL DEFAULT 'REGISTRATION',
+    otp_hash CHAR(64) NOT NULL,
+    expires_at DATETIME(6) NOT NULL,
+    attempts SMALLINT UNSIGNED NOT NULL DEFAULT 0,
+    max_attempts SMALLINT UNSIGNED NOT NULL DEFAULT 5,
+    verified_at DATETIME(6) NULL,
+    used_at DATETIME(6) NULL,
+    ip_address VARCHAR(45) NULL,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    INDEX idx_otp_email_created (email, created_at),
+    INDEX idx_otp_mobile_created (mobile, created_at)
+  ) ENGINE=InnoDB;`,
+  `CREATE TABLE IF NOT EXISTS qr_codes (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    user_record_id BIGINT NOT NULL,
+    token_hash CHAR(64) NOT NULL UNIQUE,
+    token_prefix VARCHAR(16) NOT NULL,
+    verification_url TEXT NOT NULL,
+    qr_png_data_url MEDIUMTEXT NOT NULL,
+    status ENUM('ACTIVE', 'EXPIRED', 'REVOKED') NOT NULL DEFAULT 'ACTIVE',
+    issued_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    expires_at DATETIME(6) NOT NULL,
+    revoked_at DATETIME(6) NULL,
+    revoked_by BIGINT NULL,
+    revoke_reason TEXT NULL,
+    issued_by BIGINT NULL,
+    last_verified_at DATETIME(6) NULL,
+    scan_count INT UNSIGNED NOT NULL DEFAULT 0,
+    INDEX idx_qr_user_status (user_record_id, status),
+    CONSTRAINT fk_qr_record FOREIGN KEY (user_record_id) REFERENCES user_records(id) ON DELETE CASCADE
+  ) ENGINE=InnoDB;`,
+  `CREATE TABLE IF NOT EXISTS qr_scan_logs (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    qr_code_id BIGINT NULL,
+    user_record_id BIGINT NULL,
+    scanned_by_admin_id BIGINT NOT NULL,
+    scanned_token_prefix VARCHAR(16) NOT NULL,
+    result_status ENUM('VALID', 'INVALID', 'EXPIRED', 'REVOKED', 'INACTIVE_USER', 'UNAPPROVED_USER') NOT NULL,
+    reason TEXT NOT NULL,
+    ip_address VARCHAR(45) NULL,
+    user_agent TEXT NULL,
+    scanned_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    INDEX idx_scan_at (scanned_at)
+  ) ENGINE=InnoDB;`,
+  `CREATE TABLE IF NOT EXISTS notifications (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    recipient_user_id BIGINT NULL,
+    recipient_role VARCHAR(20) NULL,
+    type VARCHAR(48) NOT NULL,
+    title VARCHAR(180) NOT NULL,
+    message TEXT NOT NULL,
+    link_path VARCHAR(255) NULL,
+    metadata_json JSON NOT NULL,
+    is_read TINYINT(1) NOT NULL DEFAULT 0,
+    read_at DATETIME(6) NULL,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    INDEX idx_notif_recipient (recipient_user_id, recipient_role, is_read)
+  ) ENGINE=InnoDB;`,
+  `CREATE TABLE IF NOT EXISTS admin_activity_logs (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    actor_user_id BIGINT NULL,
+    actor_email VARCHAR(255) NOT NULL,
+    actor_role VARCHAR(20) NOT NULL,
+    action VARCHAR(64) NOT NULL,
+    target_type VARCHAR(64) NOT NULL,
+    target_id VARCHAR(64) NULL,
+    details_json JSON NOT NULL,
+    ip_address VARCHAR(45) NULL,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    INDEX idx_audit_created (created_at)
+  ) ENGINE=InnoDB;`,
+  `CREATE TABLE IF NOT EXISTS user_field_configs (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    field_key VARCHAR(64) NOT NULL UNIQUE,
+    label VARCHAR(120) NOT NULL,
+    field_type ENUM('text', 'select', 'date', 'file') NOT NULL DEFAULT 'text',
+    is_required TINYINT(1) NOT NULL DEFAULT 0,
+    is_enabled TINYINT(1) NOT NULL DEFAULT 1,
+    is_editable_on_resubmit TINYINT(1) NOT NULL DEFAULT 1,
+    options_json JSON NOT NULL,
+    sort_order INT NOT NULL DEFAULT 0
+  ) ENGINE=InnoDB;`,
+  `CREATE TABLE IF NOT EXISTS export_history (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    admin_user_id BIGINT NOT NULL,
+    admin_email VARCHAR(255) NOT NULL,
+    filters_json JSON NOT NULL,
+    record_count INT UNSIGNED NOT NULL,
+    filename VARCHAR(255) NOT NULL,
+    exported_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+  ) ENGINE=InnoDB;`,
+  `CREATE TABLE IF NOT EXISTS system_settings (
+    \`key\` VARCHAR(100) PRIMARY KEY,
+    \`value\` TEXT NOT NULL,
+    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+    updated_by BIGINT NULL
+  ) ENGINE=InnoDB;`,
+  `CREATE TABLE IF NOT EXISTS refresh_tokens (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    user_id BIGINT NOT NULL,
+    token_hash CHAR(64) NOT NULL UNIQUE,
+    expires_at DATETIME(6) NOT NULL,
+    revoked_at DATETIME(6) NULL,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    CONSTRAINT fk_rt_user FOREIGN KEY (user_id) REFERENCES user_accounts(id) ON DELETE CASCADE
+  ) ENGINE=InnoDB;`,
+  `CREATE TABLE IF NOT EXISTS scheduled_report_logs (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    recipient_email VARCHAR(255) NOT NULL,
+    record_count INT UNSIGNED NOT NULL,
+    filename VARCHAR(255) NOT NULL,
+    status ENUM('SENT', 'FAILED') NOT NULL,
+    error_message TEXT NULL,
+    trigger_type VARCHAR(40) NOT NULL,
+    sent_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+  ) ENGINE=InnoDB;`,
+];
 
-    CREATE TABLE IF NOT EXISTS permissions (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      code TEXT NOT NULL UNIQUE,
-      label TEXT NOT NULL,
-      description TEXT NOT NULL
-    );
+export async function ensureDbInitialized(): Promise<void> {
+  if (initPromise) return initPromise;
 
-    CREATE TABLE IF NOT EXISTS role_permissions (
-      role_id INTEGER NOT NULL,
-      permission_code TEXT NOT NULL,
-      PRIMARY KEY (role_id, permission_code),
-      FOREIGN KEY (role_id) REFERENCES roles(id) ON DELETE CASCADE
-    );
+  initPromise = (async () => {
+    const cfg = getMysqlConfig();
+    if (!cfg.host || !cfg.user) {
+      throw new Error('MySQL RDS credentials (DB_HOST / DB_USER) are not configured.');
+    }
 
-    CREATE TABLE IF NOT EXISTS user_accounts (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      email TEXT NOT NULL UNIQUE,
-      mobile TEXT NOT NULL UNIQUE,
-      password_hash TEXT NOT NULL,
-      role TEXT NOT NULL CHECK (role IN ('SUPER_ADMIN', 'ADMIN', 'USER')),
-      is_active INTEGER NOT NULL DEFAULT 1,
-      is_mobile_verified INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      deleted_at TEXT NULL
-    );
+    const bootstrapConn = await mysql.createConnection({
+      host: cfg.host,
+      port: cfg.port,
+      user: cfg.user,
+      password: cfg.password,
+      connectTimeout: 8000,
+      multipleStatements: true,
+    });
+    try {
+      const batchSql = [
+        `CREATE DATABASE IF NOT EXISTS \`${cfg.database}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;`,
+        `USE \`${cfg.database}\`;`,
+        ...MYSQL_DDL_STATEMENTS,
+      ].join('\n');
+      await bootstrapConn.query(batchSql);
 
-    CREATE INDEX IF NOT EXISTS idx_user_accounts_role ON user_accounts(role);
-    CREATE INDEX IF NOT EXISTS idx_user_accounts_mobile ON user_accounts(mobile);
+      // Safely upgrade any tables previously created without newer columns
+      const [colRows] = await bootstrapConn.query(
+        `SELECT TABLE_NAME, COLUMN_NAME
+         FROM INFORMATION_SCHEMA.COLUMNS
+         WHERE TABLE_SCHEMA = ?
+           AND ((TABLE_NAME = 'admin_profiles' AND COLUMN_NAME = 'avatar_url')
+             OR (TABLE_NAME = 'qr_codes' AND COLUMN_NAME = 'qr_png_data_url')
+             OR (TABLE_NAME = 'user_accounts' AND COLUMN_NAME = 'is_email_verified')
+             OR (TABLE_NAME = 'otp_verifications' AND COLUMN_NAME = 'email'))`,
+        [cfg.database],
+      );
+      const existingCols = new Set(
+        (colRows as {TABLE_NAME: string; COLUMN_NAME: string}[]).map(
+          (r) => `${r.TABLE_NAME}.${r.COLUMN_NAME}`,
+        ),
+      );
+      if (!existingCols.has('admin_profiles.avatar_url')) {
+        await bootstrapConn.query(
+          `ALTER TABLE admin_profiles ADD COLUMN avatar_url VARCHAR(500) NOT NULL DEFAULT '/assets/images/avatar_admin_portrait_1794911291825.jpg' AFTER designation`,
+        );
+      }
+      if (!existingCols.has('qr_codes.qr_png_data_url')) {
+        await bootstrapConn.query(
+          `ALTER TABLE qr_codes ADD COLUMN qr_png_data_url MEDIUMTEXT NOT NULL AFTER verification_url`,
+        );
+      }
+      if (!existingCols.has('user_accounts.is_email_verified')) {
+        await bootstrapConn.query(
+          `ALTER TABLE user_accounts ADD COLUMN is_email_verified TINYINT(1) NOT NULL DEFAULT 0 AFTER is_mobile_verified`,
+        );
+      }
+      if (!existingCols.has('otp_verifications.email')) {
+        await bootstrapConn.query(
+          `ALTER TABLE otp_verifications ADD COLUMN email VARCHAR(255) NULL AFTER id, MODIFY COLUMN mobile VARCHAR(20) NULL DEFAULT '', ADD INDEX idx_otp_email_created (email, created_at)`,
+        );
+      }
+    } finally {
+      await bootstrapConn.end();
+    }
 
-    CREATE TABLE IF NOT EXISTS admin_profiles (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id INTEGER NOT NULL UNIQUE,
-      full_name TEXT NOT NULL,
-      department TEXT NOT NULL DEFAULT 'Verification Operations',
-      designation TEXT NOT NULL DEFAULT 'Compliance Officer',
-      avatar_url TEXT NOT NULL DEFAULT '/assets/images/avatar_admin_portrait_1794911291825.jpg',
-      permissions_json TEXT NOT NULL DEFAULT '[]',
-      created_by INTEGER NULL,
-      created_at TEXT NOT NULL,
-      FOREIGN KEY (user_id) REFERENCES user_accounts(id) ON DELETE CASCADE
-    );
+    getPool();
+  })().catch((err) => {
+    initPromise = null;
+    throw err;
+  });
 
-    CREATE TABLE IF NOT EXISTS user_records (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id INTEGER NOT NULL UNIQUE,
-      registration_id TEXT NOT NULL UNIQUE,
-      full_name TEXT NOT NULL,
-      dob TEXT NULL,
-      gender TEXT NULL,
-      address TEXT NOT NULL,
-      city TEXT NOT NULL,
-      district TEXT NOT NULL,
-      state TEXT NOT NULL,
-      country TEXT NOT NULL,
-      postal_code TEXT NOT NULL,
-      profile_photo_url TEXT NOT NULL,
-      id_proof_type TEXT NOT NULL DEFAULT 'National ID',
-      id_proof_url TEXT NULL,
-      dynamic_fields_json TEXT NOT NULL DEFAULT '{}',
-      consent_accepted INTEGER NOT NULL DEFAULT 1,
-      consent_timestamp TEXT NOT NULL,
-      approval_status TEXT NOT NULL CHECK (approval_status IN ('PENDING', 'APPROVED', 'REJECTED', 'RESUBMISSION_REQUIRED')),
-      rejection_reason TEXT NULL,
-      resubmission_note TEXT NULL,
-      reviewed_by INTEGER NULL,
-      reviewed_at TEXT NULL,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      deleted_at TEXT NULL,
-      FOREIGN KEY (user_id) REFERENCES user_accounts(id) ON DELETE CASCADE,
-      FOREIGN KEY (reviewed_by) REFERENCES user_accounts(id) ON DELETE SET NULL
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_user_records_status ON user_records(approval_status);
-    CREATE INDEX IF NOT EXISTS idx_user_records_city_state ON user_records(state, city);
-    CREATE INDEX IF NOT EXISTS idx_user_records_reg_id ON user_records(registration_id);
-
-    CREATE TABLE IF NOT EXISTS registration_requests (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_record_id INTEGER NOT NULL,
-      request_type TEXT NOT NULL CHECK (request_type IN ('INITIAL', 'RESUBMISSION')),
-      status TEXT NOT NULL CHECK (status IN ('PENDING', 'APPROVED', 'REJECTED', 'RESUBMISSION_REQUIRED')),
-      notes TEXT NULL,
-      submitted_at TEXT NOT NULL,
-      processed_by INTEGER NULL,
-      processed_at TEXT NULL,
-      FOREIGN KEY (user_record_id) REFERENCES user_records(id) ON DELETE CASCADE,
-      FOREIGN KEY (processed_by) REFERENCES user_accounts(id) ON DELETE SET NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS otp_verifications (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      mobile TEXT NOT NULL,
-      purpose TEXT NOT NULL DEFAULT 'REGISTRATION',
-      otp_hash TEXT NOT NULL,
-      expires_at TEXT NOT NULL,
-      attempts INTEGER NOT NULL DEFAULT 0,
-      max_attempts INTEGER NOT NULL DEFAULT 5,
-      verified_at TEXT NULL,
-      used_at TEXT NULL,
-      ip_address TEXT NULL,
-      created_at TEXT NOT NULL
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_otp_mobile_created ON otp_verifications(mobile, created_at);
-
-    CREATE TABLE IF NOT EXISTS qr_codes (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_record_id INTEGER NOT NULL,
-      token_hash TEXT NOT NULL UNIQUE,
-      token_prefix TEXT NOT NULL,
-      verification_url TEXT NOT NULL,
-      qr_png_data_url TEXT NOT NULL,
-      status TEXT NOT NULL CHECK (status IN ('ACTIVE', 'EXPIRED', 'REVOKED')),
-      issued_at TEXT NOT NULL,
-      expires_at TEXT NOT NULL,
-      revoked_at TEXT NULL,
-      revoked_by INTEGER NULL,
-      revoke_reason TEXT NULL,
-      issued_by INTEGER NULL,
-      last_verified_at TEXT NULL,
-      scan_count INTEGER NOT NULL DEFAULT 0,
-      FOREIGN KEY (user_record_id) REFERENCES user_records(id) ON DELETE CASCADE,
-      FOREIGN KEY (revoked_by) REFERENCES user_accounts(id) ON DELETE SET NULL,
-      FOREIGN KEY (issued_by) REFERENCES user_accounts(id) ON DELETE SET NULL
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_qr_codes_user_status ON qr_codes(user_record_id, status);
-    CREATE INDEX IF NOT EXISTS idx_qr_codes_token_hash ON qr_codes(token_hash);
-
-    CREATE TABLE IF NOT EXISTS qr_scan_logs (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      qr_code_id INTEGER NULL,
-      user_record_id INTEGER NULL,
-      scanned_by_admin_id INTEGER NOT NULL,
-      scanned_token_prefix TEXT NOT NULL,
-      result_status TEXT NOT NULL CHECK (result_status IN ('VALID', 'INVALID', 'EXPIRED', 'REVOKED', 'INACTIVE_USER', 'UNAPPROVED_USER')),
-      reason TEXT NOT NULL,
-      ip_address TEXT NULL,
-      user_agent TEXT NULL,
-      scanned_at TEXT NOT NULL,
-      FOREIGN KEY (qr_code_id) REFERENCES qr_codes(id) ON DELETE SET NULL,
-      FOREIGN KEY (user_record_id) REFERENCES user_records(id) ON DELETE SET NULL,
-      FOREIGN KEY (scanned_by_admin_id) REFERENCES user_accounts(id) ON DELETE CASCADE
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_qr_scan_logs_scanned_at ON qr_scan_logs(scanned_at);
-
-    CREATE TABLE IF NOT EXISTS notifications (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      recipient_user_id INTEGER NULL,
-      recipient_role TEXT NULL,
-      type TEXT NOT NULL,
-      title TEXT NOT NULL,
-      message TEXT NOT NULL,
-      link_path TEXT NULL,
-      metadata_json TEXT NOT NULL DEFAULT '{}',
-      is_read INTEGER NOT NULL DEFAULT 0,
-      read_at TEXT NULL,
-      created_at TEXT NOT NULL,
-      FOREIGN KEY (recipient_user_id) REFERENCES user_accounts(id) ON DELETE CASCADE
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_notifications_recipient ON notifications(recipient_user_id, recipient_role, is_read);
-
-    CREATE TABLE IF NOT EXISTS admin_activity_logs (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      actor_user_id INTEGER NULL,
-      actor_email TEXT NOT NULL,
-      actor_role TEXT NOT NULL,
-      action TEXT NOT NULL,
-      target_type TEXT NOT NULL,
-      target_id TEXT NULL,
-      details_json TEXT NOT NULL DEFAULT '{}',
-      ip_address TEXT NULL,
-      created_at TEXT NOT NULL
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON admin_activity_logs(created_at);
-
-    CREATE TABLE IF NOT EXISTS user_field_configs (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      field_key TEXT NOT NULL UNIQUE,
-      label TEXT NOT NULL,
-      field_type TEXT NOT NULL CHECK (field_type IN ('text', 'select', 'date', 'file')),
-      is_required INTEGER NOT NULL DEFAULT 0,
-      is_enabled INTEGER NOT NULL DEFAULT 1,
-      is_editable_on_resubmit INTEGER NOT NULL DEFAULT 1,
-      options_json TEXT NOT NULL DEFAULT '[]',
-      sort_order INTEGER NOT NULL DEFAULT 0
-    );
-
-    CREATE TABLE IF NOT EXISTS export_history (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      admin_user_id INTEGER NOT NULL,
-      admin_email TEXT NOT NULL,
-      filters_json TEXT NOT NULL DEFAULT '{}',
-      record_count INTEGER NOT NULL,
-      filename TEXT NOT NULL,
-      exported_at TEXT NOT NULL,
-      FOREIGN KEY (admin_user_id) REFERENCES user_accounts(id) ON DELETE CASCADE
-    );
-
-    CREATE TABLE IF NOT EXISTS system_settings (
-      key TEXT PRIMARY KEY,
-      value TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      updated_by INTEGER NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS refresh_tokens (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id INTEGER NOT NULL,
-      token_hash TEXT NOT NULL UNIQUE,
-      expires_at TEXT NOT NULL,
-      revoked_at TEXT NULL,
-      created_at TEXT NOT NULL,
-      FOREIGN KEY (user_id) REFERENCES user_accounts(id) ON DELETE CASCADE
-    );
-
-    CREATE TABLE IF NOT EXISTS scheduled_report_logs (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      recipient_email TEXT NOT NULL,
-      record_count INTEGER NOT NULL,
-      filename TEXT NOT NULL,
-      status TEXT NOT NULL CHECK (status IN ('SENT', 'FAILED')),
-      error_message TEXT NULL,
-      trigger_type TEXT NOT NULL,
-      sent_at TEXT NOT NULL
-    );
-  `);
+  return initPromise;
 }
 
-let seeded = false;
-
-function ensureFixedAdmin(db: DatabaseSyncType): void {
-  try {
-    (process as unknown as {loadEnvFile?: () => void}).loadEnvFile?.();
-  } catch {
-    // .env may not exist in all environments
-  }
-
+async function ensureFixedAdmin(): Promise<void> {
+  loadEnvSafe();
   const fixedEmail = (process.env['FIXED_ADMIN_EMAIL'] || 'kishore.sathayush@gmail.com')
     .trim()
     .toLowerCase();
@@ -309,7 +444,7 @@ function ensureFixedAdmin(db: DatabaseSyncType): void {
     return;
   }
 
-  const now = new Date().toISOString();
+  const now = toMysqlDateTime();
   const allPerms = [
     'can_view_registrations',
     'can_approve_registrations',
@@ -319,548 +454,568 @@ function ensureFixedAdmin(db: DatabaseSyncType): void {
     'can_manage_users',
   ];
 
-  const existing = db
-    .prepare('SELECT id FROM user_accounts WHERE lower(email) = ?')
-    .get(fixedEmail) as {id: number} | undefined;
+  const existing = await queryOne<{id: number}>(
+    'SELECT id FROM user_accounts WHERE LOWER(email) = ?',
+    [fixedEmail],
+  );
 
   let adminId: number;
   if (existing) {
     adminId = existing.id;
-    db.prepare(
+    await executeSql(
       `UPDATE user_accounts
        SET password_hash = ?, role = 'SUPER_ADMIN', is_active = 1, is_mobile_verified = 1, updated_at = ?
        WHERE id = ?`,
-    ).run(hashPassword(fixedPassword), now, adminId);
-  } else {
-    const mobileCandidate = process.env['FIXED_ADMIN_MOBILE'] || '+919550000955';
-    const res = db
-      .prepare(
-        `INSERT INTO user_accounts
-          (email, mobile, password_hash, role, is_active, is_mobile_verified, created_at, updated_at)
-         VALUES (?, ?, ?, 'SUPER_ADMIN', 1, 1, ?, ?)`,
-      )
-      .run(fixedEmail, mobileCandidate, hashPassword(fixedPassword), now, now);
-    adminId = Number(res.lastInsertRowid);
-  }
-
-  const existingProfile = db
-    .prepare('SELECT id FROM admin_profiles WHERE user_id = ?')
-    .get(adminId) as {id: number} | undefined;
-
-  if (existingProfile) {
-    db.prepare('UPDATE admin_profiles SET permissions_json = ? WHERE user_id = ?').run(
-      JSON.stringify(allPerms),
-      adminId,
+      [hashPassword(fixedPassword), now, adminId],
     );
   } else {
-    db.prepare(
+    const mobileCandidate = process.env['FIXED_ADMIN_MOBILE'] || '+919550000955';
+    const res = await executeSql(
+      `INSERT INTO user_accounts
+        (email, mobile, password_hash, role, is_active, is_mobile_verified, created_at, updated_at)
+       VALUES (?, ?, ?, 'SUPER_ADMIN', 1, 1, ?, ?)`,
+      [fixedEmail, mobileCandidate, hashPassword(fixedPassword), now, now],
+    );
+    adminId = Number(res.insertId);
+  }
+
+  const existingProfile = await queryOne<{id: number}>(
+    'SELECT id FROM admin_profiles WHERE user_id = ?',
+    [adminId],
+  );
+
+  if (existingProfile) {
+    await executeSql('UPDATE admin_profiles SET permissions_json = ? WHERE user_id = ?', [
+      JSON.stringify(allPerms),
+      adminId,
+    ]);
+  } else {
+    await executeSql(
       `INSERT INTO admin_profiles
         (user_id, full_name, department, designation, avatar_url, permissions_json, created_by, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(
-      adminId,
-      'Kishore (Primary Admin)',
-      'Executive Governance',
-      'Fixed Super Administrator',
-      '/assets/images/avatar_admin_portrait_1794911291825.jpg',
-      JSON.stringify(allPerms),
-      adminId,
-      now,
+      [
+        adminId,
+        'Kishore (Primary Admin)',
+        'Executive Governance',
+        'Fixed Super Administrator',
+        '/assets/images/avatar_admin_portrait_1794911291825.jpg',
+        JSON.stringify(allPerms),
+        adminId,
+        now,
+      ],
     );
   }
 }
 
 export async function ensureSeeded(baseUrl = 'http://localhost:3000'): Promise<void> {
   if (seeded) return;
-  const db = getDb();
+  if (seedingPromise) return seedingPromise;
 
-  const existingCount = db
-    .prepare('SELECT COUNT(*) as cnt FROM user_accounts')
-    .get() as {cnt: number};
+  seedingPromise = (async () => {
+    await ensureDbInitialized();
 
-  if (existingCount.cnt > 0) {
-    ensureFixedAdmin(db);
-    seeded = true;
-    return;
-  }
+    const existingCountRow = await queryOne<{cnt: number}>(
+      'SELECT COUNT(*) as cnt FROM user_accounts',
+    );
+    const existingCount = Number(existingCountRow?.cnt || 0);
 
-  const now = new Date().toISOString();
+    if (existingCount > 0) {
+      await ensureFixedAdmin();
+      seeded = true;
+      return;
+    }
 
-  // Roles
-  const insertRole = db.prepare(
-    'INSERT OR IGNORE INTO roles (name, description) VALUES (?, ?)',
-  );
-  insertRole.run('SUPER_ADMIN', 'Full system authority including admin accounts, audit logs, and settings.');
-  insertRole.run('ADMIN', 'Delegated verification officer with configurable module permissions.');
-  insertRole.run('USER', 'Registered member eligible for credential verification.');
+    const now = toMysqlDateTime();
 
-  // Permissions
-  const perms: [string, string, string][] = [
-    ['can_view_registrations', 'View Registrations', 'Inspect registration queue and identity documents'],
-    ['can_approve_registrations', 'Approve & Reject', 'Approve, reject, or request resubmission on applications'],
-    ['can_manage_qr', 'Manage QR Codes', 'Issue, regenerate, and revoke QR credentials'],
-    ['can_scan_qr', 'Scan & Verify QR', 'Access live camera QR scanner and view holder verification photo'],
-    ['can_export_excel', 'Export Excel', 'Export authorized records to Excel (.xlsx)'],
-    ['can_manage_users', 'Manage Users', 'Activate, deactivate, or archive user accounts'],
-  ];
-  const insertPerm = db.prepare(
-    'INSERT OR IGNORE INTO permissions (code, label, description) VALUES (?, ?, ?)',
-  );
-  for (const p of perms) {
-    insertPerm.run(...p);
-  }
+    // Roles
+    await executeSql(
+      'INSERT IGNORE INTO roles (name, description) VALUES (?, ?)',
+      ['SUPER_ADMIN', 'Full system authority including admin accounts, audit logs, and settings.'],
+    );
+    await executeSql(
+      'INSERT IGNORE INTO roles (name, description) VALUES (?, ?)',
+      ['ADMIN', 'Delegated verification officer with configurable module permissions.'],
+    );
+    await executeSql(
+      'INSERT IGNORE INTO roles (name, description) VALUES (?, ?)',
+      ['USER', 'Registered member eligible for credential verification.'],
+    );
 
-  // System settings
-  const insertSetting = db.prepare(
-    'INSERT OR IGNORE INTO system_settings (key, value, updated_at) VALUES (?, ?, ?)',
-  );
-  insertSetting.run('organization_name', 'Secure QR Verification Authority', now);
-  insertSetting.run('qr_validity_days', '365', now);
-  insertSetting.run('allow_multiple_active_qr', 'false', now);
-  insertSetting.run('otp_expiry_minutes', '5', now);
-  insertSetting.run('max_otp_attempts', '5', now);
-  insertSetting.run('id_proof_required', 'true', now);
-  insertSetting.run('verification_alert_enabled', 'true', now);
+    // Permissions
+    const perms: [string, string, string][] = [
+      ['can_view_registrations', 'View Registrations', 'Inspect registration queue and identity documents'],
+      ['can_approve_registrations', 'Approve & Reject', 'Approve, reject, or request resubmission on applications'],
+      ['can_manage_qr', 'Manage QR Codes', 'Issue, regenerate, and revoke QR credentials'],
+      ['can_scan_qr', 'Scan & Verify QR', 'Access live camera QR scanner and view holder verification photo'],
+      ['can_export_excel', 'Export Excel', 'Export authorized records to Excel (.xlsx)'],
+      ['can_manage_users', 'Manage Users', 'Activate, deactivate, or archive user accounts'],
+    ];
+    for (const p of perms) {
+      await executeSql(
+        'INSERT IGNORE INTO permissions (code, label, description) VALUES (?, ?, ?)',
+        p,
+      );
+    }
 
-  // Dynamic User Field Configs
-  const insertField = db.prepare(
-    `INSERT OR IGNORE INTO user_field_configs
-      (field_key, label, field_type, is_required, is_enabled, is_editable_on_resubmit, options_json, sort_order)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  );
-  insertField.run('organization', 'Organization / Employer', 'text', 1, 1, 1, '[]', 1);
-  insertField.run('department', 'Department / Division', 'text', 0, 1, 1, '[]', 2);
-  insertField.run(
-    'access_tier',
-    'Credential Tier',
-    'select',
-    1,
-    1,
-    0,
-    JSON.stringify(['Standard Member', 'Facility Contractor', 'Executive Pass', 'Visitor Escort']),
-    3,
-  );
-  insertField.run('emergency_contact', 'Emergency Contact Number', 'text', 0, 1, 1, '[]', 4);
+    // System settings
+    const defaultSettings: [string, string][] = [
+      ['organization_name', 'Secure QR Verification Authority'],
+      ['qr_validity_days', '365'],
+      ['allow_multiple_active_qr', 'false'],
+      ['otp_expiry_minutes', '5'],
+      ['max_otp_attempts', '5'],
+      ['id_proof_required', 'true'],
+      ['verification_alert_enabled', 'true'],
+    ];
+    for (const [k, v] of defaultSettings) {
+      await executeSql(
+        'INSERT IGNORE INTO system_settings (`key`, `value`, updated_at) VALUES (?, ?, ?)',
+        [k, v, now],
+      );
+    }
 
-  // Super Admin
-  const insertUser = db.prepare(
-    `INSERT INTO user_accounts
-      (email, mobile, password_hash, role, is_active, is_mobile_verified, created_at, updated_at)
-     VALUES (?, ?, ?, ?, 1, 1, ?, ?)`,
-  );
-  const superAdminRes = insertUser.run(
-    'superadmin@secureqr.gov',
-    '+15550100001',
-    hashPassword('SuperAdmin@2026!'),
-    'SUPER_ADMIN',
-    now,
-    now,
-  );
-  const superAdminId = Number(superAdminRes.lastInsertRowid);
+    // Dynamic User Field Configs
+    const fieldSeeds: unknown[][] = [
+      ['organization', 'Organization / Employer', 'text', 1, 1, 1, '[]', 1],
+      ['department', 'Department / Division', 'text', 0, 1, 1, '[]', 2],
+      [
+        'access_tier',
+        'Credential Tier',
+        'select',
+        1,
+        1,
+        0,
+        JSON.stringify(['Standard Member', 'Facility Contractor', 'Executive Pass', 'Visitor Escort']),
+        3,
+      ],
+      ['emergency_contact', 'Emergency Contact Number', 'text', 0, 1, 1, '[]', 4],
+    ];
+    for (const f of fieldSeeds) {
+      await executeSql(
+        `INSERT IGNORE INTO user_field_configs
+          (field_key, label, field_type, is_required, is_enabled, is_editable_on_resubmit, options_json, sort_order)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        f,
+      );
+    }
 
-  db.prepare(
-    `INSERT INTO admin_profiles
-      (user_id, full_name, department, designation, avatar_url, permissions_json, created_by, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    superAdminId,
-    'Eleanor Vance',
-    'Governance & Trust Operations',
-    'Chief Security Administrator',
-    '/assets/images/avatar_admin_portrait_1794911291825.jpg',
-    JSON.stringify(perms.map((p) => p[0])),
-    superAdminId,
-    now,
-  );
+    // Super Admin
+    const superAdminRes = await executeSql(
+      `INSERT INTO user_accounts
+        (email, mobile, password_hash, role, is_active, is_mobile_verified, created_at, updated_at)
+       VALUES (?, ?, ?, 'SUPER_ADMIN', 1, 1, ?, ?)`,
+      ['superadmin@secureqr.gov', '+15550100001', hashPassword('SuperAdmin@2026!'), now, now],
+    );
+    const superAdminId = Number(superAdminRes.insertId);
 
-  // Delegated Admin
-  const verifierAdminRes = insertUser.run(
-    'admin.verifier@secureqr.gov',
-    '+15550100002',
-    hashPassword('Verifier@2026!'),
-    'ADMIN',
-    now,
-    now,
-  );
-  const verifierAdminId = Number(verifierAdminRes.lastInsertRowid);
+    await executeSql(
+      `INSERT INTO admin_profiles
+        (user_id, full_name, department, designation, avatar_url, permissions_json, created_by, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        superAdminId,
+        'Eleanor Vance',
+        'Governance & Trust Operations',
+        'Chief Security Administrator',
+        '/assets/images/avatar_admin_portrait_1794911291825.jpg',
+        JSON.stringify(perms.map((p) => p[0])),
+        superAdminId,
+        now,
+      ],
+    );
 
-  db.prepare(
-    `INSERT INTO admin_profiles
-      (user_id, full_name, department, designation, avatar_url, permissions_json, created_by, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    verifierAdminId,
-    'Marcus Sterling',
-    'Identity Review Desk',
-    'Senior Verification Officer',
-    '/assets/images/avatar_admin_portrait_1794911291825.jpg',
-    JSON.stringify([
-      'can_view_registrations',
-      'can_approve_registrations',
-      'can_manage_qr',
-      'can_scan_qr',
-      'can_export_excel',
-    ]),
-    superAdminId,
-    now,
-  );
+    // Delegated Admin
+    const verifierAdminRes = await executeSql(
+      `INSERT INTO user_accounts
+        (email, mobile, password_hash, role, is_active, is_mobile_verified, created_at, updated_at)
+       VALUES (?, ?, ?, 'ADMIN', 1, 1, ?, ?)`,
+      ['admin.verifier@secureqr.gov', '+15550100002', hashPassword('Verifier@2026!'), now, now],
+    );
+    const verifierAdminId = Number(verifierAdminRes.insertId);
 
-  // Sample User 1: APPROVED with Active 256-bit QR Code
-  const u1Res = insertUser.run(
-    'aarav.sharma@enterprise.org',
-    '+15550101001',
-    hashPassword('Member@2026!'),
-    'USER',
-    now,
-    now,
-  );
-  const u1Id = Number(u1Res.lastInsertRowid);
-  const u1RecRes = db
-    .prepare(
+    await executeSql(
+      `INSERT INTO admin_profiles
+        (user_id, full_name, department, designation, avatar_url, permissions_json, created_by, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        verifierAdminId,
+        'Marcus Sterling',
+        'Identity Review Desk',
+        'Senior Verification Officer',
+        '/assets/images/avatar_admin_portrait_1794911291825.jpg',
+        JSON.stringify([
+          'can_view_registrations',
+          'can_approve_registrations',
+          'can_manage_qr',
+          'can_scan_qr',
+          'can_export_excel',
+        ]),
+        superAdminId,
+        now,
+      ],
+    );
+
+    // Sample User 1: APPROVED with Active 256-bit QR Code
+    const u1Res = await executeSql(
+      `INSERT INTO user_accounts
+        (email, mobile, password_hash, role, is_active, is_mobile_verified, created_at, updated_at)
+       VALUES (?, ?, ?, 'USER', 1, 1, ?, ?)`,
+      ['aarav.sharma@enterprise.org', '+15550101001', hashPassword('Member@2026!'), now, now],
+    );
+    const u1Id = Number(u1Res.insertId);
+    const u1CreatedAt = toMysqlDateTime(Date.now() - 86400000 * 5);
+    const u1RecRes = await executeSql(
       `INSERT INTO user_records
         (user_id, registration_id, full_name, dob, gender, address, city, district, state, country, postal_code,
          profile_photo_url, id_proof_type, id_proof_url, dynamic_fields_json, consent_accepted, consent_timestamp,
          approval_status, reviewed_by, reviewed_at, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 'APPROVED', ?, ?, ?, ?)`,
-    )
-    .run(
-      u1Id,
-      'SQR-2026-000101',
-      'Aarav Sharma',
-      '1993-04-18',
-      'Male',
-      '450 Mission Street, Suite 1200',
-      'San Francisco',
-      'San Francisco County',
-      'California',
-      'United States',
-      '94105',
-      '/assets/images/avatar_member_portrait_1794911275468.jpg',
-      'National Passport',
-      '/assets/images/brand_shield_emblem_1794911274112.jpg',
-      JSON.stringify({
-        organization: 'Pacific Cloud Infrastructure',
-        department: 'Platform Security',
-        access_tier: 'Executive Pass',
-        emergency_contact: '+15550199911',
-      }),
-      now,
-      superAdminId,
-      now,
-      new Date(Date.now() - 86400000 * 5).toISOString(),
-      now,
+      [
+        u1Id,
+        'SQR-2026-000101',
+        'Aarav Sharma',
+        '1993-04-18',
+        'Male',
+        '450 Mission Street, Suite 1200',
+        'San Francisco',
+        'San Francisco County',
+        'California',
+        'United States',
+        '94105',
+        '/assets/images/avatar_member_portrait_1794911275468.jpg',
+        'National Passport',
+        '/assets/images/brand_shield_emblem_1794911274112.jpg',
+        JSON.stringify({
+          organization: 'Pacific Cloud Infrastructure',
+          department: 'Platform Security',
+          access_tier: 'Executive Pass',
+          emergency_contact: '+15550199911',
+        }),
+        now,
+        superAdminId,
+        now,
+        u1CreatedAt,
+        now,
+      ],
     );
-  const u1RecId = Number(u1RecRes.lastInsertRowid);
+    const u1RecId = Number(u1RecRes.insertId);
 
-  db.prepare(
-    `INSERT INTO registration_requests
-      (user_record_id, request_type, status, notes, submitted_at, processed_by, processed_at)
-     VALUES (?, 'INITIAL', 'APPROVED', 'Identity and passport verified.', ?, ?, ?)`,
-  ).run(u1RecId, new Date(Date.now() - 86400000 * 5).toISOString(), superAdminId, now);
+    await executeSql(
+      `INSERT INTO registration_requests
+        (user_record_id, request_type, status, notes, submitted_at, processed_by, processed_at)
+       VALUES (?, 'INITIAL', 'APPROVED', 'Identity and passport verified.', ?, ?, ?)`,
+      [u1RecId, u1CreatedAt, superAdminId, now],
+    );
 
-  // Generate genuine 256-bit QR token & store ONLY its SHA-256 hash
-  const rawToken = generateSecureQrToken();
-  const tokenHash = sha256Hex(rawToken);
-  const tokenPrefix = tokenHash.slice(0, 12);
-  const verifyUrl = `${baseUrl.replace(/\/$/, '')}/verify?token=${encodeURIComponent(rawToken)}`;
-  const qrPngDataUrl = await QRCode.toDataURL(verifyUrl, {
-    errorCorrectionLevel: 'H',
-    margin: 2,
-    width: 420,
-    color: {dark: '#0F172A', light: '#FFFFFF'},
-  });
-  const expiresAt = new Date(Date.now() + 365 * 86400000).toISOString();
+    const rawToken = generateSecureQrToken();
+    const tokenHash = sha256Hex(rawToken);
+    const tokenPrefix = tokenHash.slice(0, 12);
+    const verifyUrl = `${baseUrl.replace(/\/$/, '')}/verify?token=${encodeURIComponent(rawToken)}`;
+    const qrPngDataUrl = await QRCode.toDataURL(verifyUrl, {
+      errorCorrectionLevel: 'H',
+      margin: 2,
+      width: 420,
+      color: {dark: '#0F172A', light: '#FFFFFF'},
+    });
+    const expiresAt = toMysqlDateTime(Date.now() + 365 * 86400000);
 
-  const qrRes = db
-    .prepare(
+    const qrRes = await executeSql(
       `INSERT INTO qr_codes
         (user_record_id, token_hash, token_prefix, verification_url, qr_png_data_url, status, issued_at, expires_at, issued_by, last_verified_at, scan_count)
        VALUES (?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?, ?, 2)`,
-    )
-    .run(u1RecId, tokenHash, tokenPrefix, verifyUrl, qrPngDataUrl, now, expiresAt, superAdminId, now);
+      [u1RecId, tokenHash, tokenPrefix, verifyUrl, qrPngDataUrl, now, expiresAt, superAdminId, now],
+    );
 
-  db.prepare(
-    `INSERT INTO qr_scan_logs
-      (qr_code_id, user_record_id, scanned_by_admin_id, scanned_token_prefix, result_status, reason, ip_address, user_agent, scanned_at)
-     VALUES (?, ?, ?, ?, 'VALID', 'Active credential verified at main lobby.', '127.0.0.1', 'Seed/Verifier', ?)`,
-  ).run(Number(qrRes.lastInsertRowid), u1RecId, verifierAdminId, tokenPrefix, now);
+    await executeSql(
+      `INSERT INTO qr_scan_logs
+        (qr_code_id, user_record_id, scanned_by_admin_id, scanned_token_prefix, result_status, reason, ip_address, user_agent, scanned_at)
+       VALUES (?, ?, ?, ?, 'VALID', 'Active credential verified at main lobby.', '127.0.0.1', 'Seed/Verifier', ?)`,
+      [Number(qrRes.insertId), u1RecId, verifierAdminId, tokenPrefix, now],
+    );
 
-  // Sample User 2: PENDING
-  const u2Res = insertUser.run(
-    'priya.nair@meridianlabs.io',
-    '+15550101002',
-    hashPassword('Member@2026!'),
-    'USER',
-    now,
-    now,
-  );
-  const u2Id = Number(u2Res.lastInsertRowid);
-  const u2RecRes = db
-    .prepare(
+    // Sample User 2: PENDING
+    const u2Res = await executeSql(
+      `INSERT INTO user_accounts
+        (email, mobile, password_hash, role, is_active, is_mobile_verified, created_at, updated_at)
+       VALUES (?, ?, ?, 'USER', 1, 1, ?, ?)`,
+      ['priya.nair@meridianlabs.io', '+15550101002', hashPassword('Member@2026!'), now, now],
+    );
+    const u2Id = Number(u2Res.insertId);
+    const u2CreatedAt = toMysqlDateTime(Date.now() - 3600000 * 6);
+    const u2RecRes = await executeSql(
       `INSERT INTO user_records
         (user_id, registration_id, full_name, dob, gender, address, city, district, state, country, postal_code,
          profile_photo_url, id_proof_type, id_proof_url, dynamic_fields_json, consent_accepted, consent_timestamp,
          approval_status, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 'PENDING', ?, ?)`,
-    )
-    .run(
-      u2Id,
-      'SQR-2026-000102',
-      'Priya Nair',
-      '1995-09-12',
-      'Female',
-      '712 Congress Ave, Floor 8',
-      'Austin',
-      'Travis County',
-      'Texas',
-      'United States',
-      '78701',
-      '/assets/images/avatar_admin_portrait_1794911291825.jpg',
-      'Driver License',
-      '/assets/images/brand_shield_emblem_1794911274112.jpg',
-      JSON.stringify({
-        organization: 'Meridian BioSystems',
-        department: 'Clinical Research',
-        access_tier: 'Standard Member',
-        emergency_contact: '+15550199922',
-      }),
-      now,
-      new Date(Date.now() - 3600000 * 6).toISOString(),
-      now,
+      [
+        u2Id,
+        'SQR-2026-000102',
+        'Priya Nair',
+        '1995-09-12',
+        'Female',
+        '712 Congress Ave, Floor 8',
+        'Austin',
+        'Travis County',
+        'Texas',
+        'United States',
+        '78701',
+        '/assets/images/avatar_admin_portrait_1794911291825.jpg',
+        'Driver License',
+        '/assets/images/brand_shield_emblem_1794911274112.jpg',
+        JSON.stringify({
+          organization: 'Meridian BioSystems',
+          department: 'Clinical Research',
+          access_tier: 'Standard Member',
+          emergency_contact: '+15550199922',
+        }),
+        now,
+        u2CreatedAt,
+        now,
+      ],
     );
-  db.prepare(
-    `INSERT INTO registration_requests
-      (user_record_id, request_type, status, notes, submitted_at)
-     VALUES (?, 'INITIAL', 'PENDING', 'Awaiting Admin review.', ?)`,
-  ).run(Number(u2RecRes.lastInsertRowid), new Date(Date.now() - 3600000 * 6).toISOString());
+    const u2RecId = Number(u2RecRes.insertId);
+    await executeSql(
+      `INSERT INTO registration_requests
+        (user_record_id, request_type, status, notes, submitted_at)
+       VALUES (?, 'INITIAL', 'PENDING', 'Awaiting Admin review.', ?)`,
+      [u2RecId, u2CreatedAt],
+    );
 
-  // Sample User 3: PENDING
-  const u3Res = insertUser.run(
-    'daniel.chen@northstar.co',
-    '+15550101003',
-    hashPassword('Member@2026!'),
-    'USER',
-    now,
-    now,
-  );
-  const u3Id = Number(u3Res.lastInsertRowid);
-  const u3RecRes = db
-    .prepare(
+    // Sample User 3: PENDING
+    const u3Res = await executeSql(
+      `INSERT INTO user_accounts
+        (email, mobile, password_hash, role, is_active, is_mobile_verified, created_at, updated_at)
+       VALUES (?, ?, ?, 'USER', 1, 1, ?, ?)`,
+      ['daniel.chen@northstar.co', '+15550101003', hashPassword('Member@2026!'), now, now],
+    );
+    const u3Id = Number(u3Res.insertId);
+    const u3CreatedAt = toMysqlDateTime(Date.now() - 3600000 * 2);
+    const u3RecRes = await executeSql(
       `INSERT INTO user_records
         (user_id, registration_id, full_name, dob, gender, address, city, district, state, country, postal_code,
          profile_photo_url, id_proof_type, id_proof_url, dynamic_fields_json, consent_accepted, consent_timestamp,
          approval_status, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 'PENDING', ?, ?)`,
-    )
-    .run(
-      u3Id,
-      'SQR-2026-000103',
-      'Daniel Chen',
-      '1990-11-03',
-      'Male',
-      '200 Clarendon St',
-      'Boston',
-      'Suffolk County',
-      'Massachusetts',
-      'United States',
-      '02116',
-      '/assets/images/avatar_member_portrait_1794911275468.jpg',
-      'State ID',
-      '/assets/images/brand_shield_emblem_1794911274112.jpg',
-      JSON.stringify({
-        organization: 'Northstar Logistics',
-        department: 'Field Operations',
-        access_tier: 'Facility Contractor',
-        emergency_contact: '+15550199933',
-      }),
-      now,
-      new Date(Date.now() - 3600000 * 2).toISOString(),
-      now,
+      [
+        u3Id,
+        'SQR-2026-000103',
+        'Daniel Chen',
+        '1990-11-03',
+        'Male',
+        '200 Clarendon St',
+        'Boston',
+        'Suffolk County',
+        'Massachusetts',
+        'United States',
+        '02116',
+        '/assets/images/avatar_member_portrait_1794911275468.jpg',
+        'State ID',
+        '/assets/images/brand_shield_emblem_1794911274112.jpg',
+        JSON.stringify({
+          organization: 'Northstar Logistics',
+          department: 'Field Operations',
+          access_tier: 'Facility Contractor',
+          emergency_contact: '+15550199933',
+        }),
+        now,
+        u3CreatedAt,
+        now,
+      ],
     );
-  db.prepare(
-    `INSERT INTO registration_requests
-      (user_record_id, request_type, status, notes, submitted_at)
-     VALUES (?, 'INITIAL', 'PENDING', 'Awaiting Admin review.', ?)`,
-  ).run(Number(u3RecRes.lastInsertRowid), new Date(Date.now() - 3600000 * 2).toISOString());
+    const u3RecId = Number(u3RecRes.insertId);
+    await executeSql(
+      `INSERT INTO registration_requests
+        (user_record_id, request_type, status, notes, submitted_at)
+       VALUES (?, 'INITIAL', 'PENDING', 'Awaiting Admin review.', ?)`,
+      [u3RecId, u3CreatedAt],
+    );
 
-  // Sample User 4: RESUBMISSION_REQUIRED
-  const u4Res = insertUser.run(
-    'sofia.rodriguez@civicgrid.org',
-    '+15550101004',
-    hashPassword('Member@2026!'),
-    'USER',
-    now,
-    now,
-  );
-  const u4Id = Number(u4Res.lastInsertRowid);
-  const u4RecRes = db
-    .prepare(
+    // Sample User 4: RESUBMISSION_REQUIRED
+    const u4Res = await executeSql(
+      `INSERT INTO user_accounts
+        (email, mobile, password_hash, role, is_active, is_mobile_verified, created_at, updated_at)
+       VALUES (?, ?, ?, 'USER', 1, 1, ?, ?)`,
+      ['sofia.rodriguez@civicgrid.org', '+15550101004', hashPassword('Member@2026!'), now, now],
+    );
+    const u4Id = Number(u4Res.insertId);
+    const u4CreatedAt = toMysqlDateTime(Date.now() - 86400000 * 2);
+    const u4RecRes = await executeSql(
       `INSERT INTO user_records
         (user_id, registration_id, full_name, dob, gender, address, city, district, state, country, postal_code,
          profile_photo_url, id_proof_type, id_proof_url, dynamic_fields_json, consent_accepted, consent_timestamp,
          approval_status, resubmission_note, reviewed_by, reviewed_at, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 'RESUBMISSION_REQUIRED', ?, ?, ?, ?, ?)`,
-    )
-    .run(
-      u4Id,
-      'SQR-2026-000104',
-      'Sofia Rodriguez',
-      '1992-07-29',
-      'Female',
-      '88 Colin P Kelly Jr St',
-      'San Jose',
-      'Santa Clara County',
-      'California',
-      'United States',
-      '95113',
-      '/assets/images/avatar_admin_portrait_1794911291825.jpg',
-      'National Passport',
-      '/assets/images/brand_shield_emblem_1794911274112.jpg',
-      JSON.stringify({
-        organization: 'CivicGrid Energy',
-        department: 'Grid Telemetry',
-        access_tier: 'Facility Contractor',
-        emergency_contact: '+15550199944',
-      }),
-      now,
-      'Please update street address with suite number and re-upload a clear ID proof image.',
-      verifierAdminId,
-      now,
-      new Date(Date.now() - 86400000 * 2).toISOString(),
-      now,
+      [
+        u4Id,
+        'SQR-2026-000104',
+        'Sofia Rodriguez',
+        '1992-07-29',
+        'Female',
+        '88 Colin P Kelly Jr St',
+        'San Jose',
+        'Santa Clara County',
+        'California',
+        'United States',
+        '95113',
+        '/assets/images/avatar_admin_portrait_1794911291825.jpg',
+        'National Passport',
+        '/assets/images/brand_shield_emblem_1794911274112.jpg',
+        JSON.stringify({
+          organization: 'CivicGrid Energy',
+          department: 'Grid Telemetry',
+          access_tier: 'Facility Contractor',
+          emergency_contact: '+15550199944',
+        }),
+        now,
+        'Please update street address with suite number and re-upload a clear ID proof image.',
+        verifierAdminId,
+        now,
+        u4CreatedAt,
+        now,
+      ],
     );
-  db.prepare(
-    `INSERT INTO registration_requests
-      (user_record_id, request_type, status, notes, submitted_at, processed_by, processed_at)
-     VALUES (?, 'INITIAL', 'RESUBMISSION_REQUIRED', 'Address clarification requested.', ?, ?, ?)`,
-  ).run(Number(u4RecRes.lastInsertRowid), new Date(Date.now() - 86400000 * 2).toISOString(), verifierAdminId, now);
+    const u4RecId = Number(u4RecRes.insertId);
+    await executeSql(
+      `INSERT INTO registration_requests
+        (user_record_id, request_type, status, notes, submitted_at, processed_by, processed_at)
+       VALUES (?, 'INITIAL', 'RESUBMISSION_REQUIRED', 'Address clarification requested.', ?, ?, ?)`,
+      [u4RecId, u4CreatedAt, verifierAdminId, now],
+    );
 
-  // Sample User 5: REJECTED
-  const u5Res = insertUser.run(
-    'liam.okafor@example.net',
-    '+15550101005',
-    hashPassword('Member@2026!'),
-    'USER',
-    now,
-    now,
-  );
-  const u5Id = Number(u5Res.lastInsertRowid);
-  const u5RecRes = db
-    .prepare(
+    // Sample User 5: REJECTED
+    const u5Res = await executeSql(
+      `INSERT INTO user_accounts
+        (email, mobile, password_hash, role, is_active, is_mobile_verified, created_at, updated_at)
+       VALUES (?, ?, ?, 'USER', 1, 1, ?, ?)`,
+      ['liam.okafor@example.net', '+15550101005', hashPassword('Member@2026!'), now, now],
+    );
+    const u5Id = Number(u5Res.insertId);
+    const u5CreatedAt = toMysqlDateTime(Date.now() - 86400000 * 3);
+    const u5RecRes = await executeSql(
       `INSERT INTO user_records
         (user_id, registration_id, full_name, dob, gender, address, city, district, state, country, postal_code,
          profile_photo_url, id_proof_type, id_proof_url, dynamic_fields_json, consent_accepted, consent_timestamp,
          approval_status, rejection_reason, reviewed_by, reviewed_at, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 'REJECTED', ?, ?, ?, ?, ?)`,
-    )
-    .run(
-      u5Id,
-      'SQR-2026-000105',
-      'Liam Okafor',
-      '1988-02-14',
-      'Male',
-      '1400 Brickell Ave',
-      'Miami',
-      'Miami-Dade County',
-      'Florida',
-      'United States',
-      '33131',
-      '/assets/images/avatar_member_portrait_1794911275468.jpg',
-      'National ID',
-      '/assets/images/brand_shield_emblem_1794911274112.jpg',
-      JSON.stringify({
-        organization: 'Independent Contractor',
-        department: 'External',
-        access_tier: 'Visitor Escort',
-        emergency_contact: '+15550199955',
-      }),
-      now,
-      'Submitted government identification expired prior to application date.',
-      superAdminId,
-      now,
-      new Date(Date.now() - 86400000 * 3).toISOString(),
-      now,
+      [
+        u5Id,
+        'SQR-2026-000105',
+        'Liam Okafor',
+        '1988-02-14',
+        'Male',
+        '1400 Brickell Ave',
+        'Miami',
+        'Miami-Dade County',
+        'Florida',
+        'United States',
+        '33131',
+        '/assets/images/avatar_member_portrait_1794911275468.jpg',
+        'National ID',
+        '/assets/images/brand_shield_emblem_1794911274112.jpg',
+        JSON.stringify({
+          organization: 'Independent Contractor',
+          department: 'External',
+          access_tier: 'Visitor Escort',
+          emergency_contact: '+15550199955',
+        }),
+        now,
+        'Submitted government identification expired prior to application date.',
+        superAdminId,
+        now,
+        u5CreatedAt,
+        now,
+      ],
     );
-  db.prepare(
-    `INSERT INTO registration_requests
-      (user_record_id, request_type, status, notes, submitted_at, processed_by, processed_at)
-     VALUES (?, 'INITIAL', 'REJECTED', 'Expired ID document.', ?, ?, ?)`,
-  ).run(Number(u5RecRes.lastInsertRowid), new Date(Date.now() - 86400000 * 3).toISOString(), superAdminId, now);
+    const u5RecId = Number(u5RecRes.insertId);
+    await executeSql(
+      `INSERT INTO registration_requests
+        (user_record_id, request_type, status, notes, submitted_at, processed_by, processed_at)
+       VALUES (?, 'INITIAL', 'REJECTED', 'Expired ID document.', ?, ?, ?)`,
+      [u5RecId, u5CreatedAt, superAdminId, now],
+    );
 
-  // Notifications
-  const insertNotif = db.prepare(
-    `INSERT INTO notifications
+    // Notifications
+    const notifSql = `INSERT INTO notifications
       (recipient_user_id, recipient_role, type, title, message, link_path, metadata_json, is_read, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)`,
-  );
-  insertNotif.run(
-    null,
-    'ADMIN',
-    'NEW_REGISTRATION',
-    'New Registration Pending Review',
-    'Priya Nair (SQR-2026-000102) submitted an application from Austin, Texas.',
-    '/admin/registrations',
-    JSON.stringify({userRecordId: Number(u2RecRes.lastInsertRowid), registrationId: 'SQR-2026-000102'}),
-    now,
-  );
-  insertNotif.run(
-    null,
-    'ADMIN',
-    'NEW_REGISTRATION',
-    'New Registration Pending Review',
-    'Daniel Chen (SQR-2026-000103) submitted an application from Boston, Massachusetts.',
-    '/admin/registrations',
-    JSON.stringify({userRecordId: Number(u3RecRes.lastInsertRowid), registrationId: 'SQR-2026-000103'}),
-    now,
-  );
-  insertNotif.run(
-    u1Id,
-    null,
-    'QR_GENERATED',
-    'Credential Approved & QR Ready',
-    'Your application (SQR-2026-000101) was approved and your active QR credential is ready.',
-    '/user/qr-card',
-    JSON.stringify({registrationId: 'SQR-2026-000101'}),
-    now,
-  );
-  insertNotif.run(
-    u4Id,
-    null,
-    'RESUBMISSION_REQUIRED',
-    'Resubmission Requested',
-    'Please update street address with suite number and re-upload a clear ID proof image.',
-    '/user/profile',
-    JSON.stringify({registrationId: 'SQR-2026-000104'}),
-    now,
-  );
-  insertNotif.run(
-    u5Id,
-    null,
-    'REGISTRATION_REJECTED',
-    'Application Rejected',
-    'Submitted government identification expired prior to application date.',
-    '/user/home',
-    JSON.stringify({registrationId: 'SQR-2026-000105'}),
-    now,
-  );
+      VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)`;
 
-  // Initial Audit Log
-  db.prepare(
-    `INSERT INTO admin_activity_logs
-      (actor_user_id, actor_email, actor_role, action, target_type, target_id, details_json, ip_address, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    superAdminId,
-    'superadmin@secureqr.gov',
-    'SUPER_ADMIN',
-    'SYSTEM_INITIALIZED',
-    'SYSTEM',
-    'bootstrap',
-    JSON.stringify({seededUsers: 5, seededAdmins: 2}),
-    '127.0.0.1',
-    now,
-  );
+    await executeSql(notifSql, [
+      null,
+      'ADMIN',
+      'NEW_REGISTRATION',
+      'New Registration Pending Review',
+      'Priya Nair (SQR-2026-000102) submitted an application from Austin, Texas.',
+      '/admin/registrations',
+      JSON.stringify({userRecordId: u2RecId, registrationId: 'SQR-2026-000102'}),
+      now,
+    ]);
+    await executeSql(notifSql, [
+      null,
+      'ADMIN',
+      'NEW_REGISTRATION',
+      'New Registration Pending Review',
+      'Daniel Chen (SQR-2026-000103) submitted an application from Boston, Massachusetts.',
+      '/admin/registrations',
+      JSON.stringify({userRecordId: u3RecId, registrationId: 'SQR-2026-000103'}),
+      now,
+    ]);
+    await executeSql(notifSql, [
+      u1Id,
+      null,
+      'QR_GENERATED',
+      'Credential Approved & QR Ready',
+      'Your application (SQR-2026-000101) was approved and your active QR credential is ready.',
+      '/user/qr-card',
+      JSON.stringify({registrationId: 'SQR-2026-000101'}),
+      now,
+    ]);
+    await executeSql(notifSql, [
+      u4Id,
+      null,
+      'RESUBMISSION_REQUIRED',
+      'Resubmission Requested',
+      'Please update street address with suite number and re-upload a clear ID proof image.',
+      '/user/profile',
+      JSON.stringify({registrationId: 'SQR-2026-000104'}),
+      now,
+    ]);
+    await executeSql(notifSql, [
+      u5Id,
+      null,
+      'REGISTRATION_REJECTED',
+      'Application Rejected',
+      'Submitted government identification expired prior to application date.',
+      '/user/home',
+      JSON.stringify({registrationId: 'SQR-2026-000105'}),
+      now,
+    ]);
 
-  ensureFixedAdmin(db);
-  seeded = true;
+    // Initial Audit Log
+    await executeSql(
+      `INSERT INTO admin_activity_logs
+        (actor_user_id, actor_email, actor_role, action, target_type, target_id, details_json, ip_address, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        superAdminId,
+        'superadmin@secureqr.gov',
+        'SUPER_ADMIN',
+        'SYSTEM_INITIALIZED',
+        'SYSTEM',
+        'bootstrap',
+        JSON.stringify({seededUsers: 5, seededAdmins: 2}),
+        '127.0.0.1',
+        now,
+      ],
+    );
+
+    await ensureFixedAdmin();
+    seeded = true;
+  })().catch((err) => {
+    seedingPromise = null;
+    throw err;
+  });
+
+  return seedingPromise;
 }

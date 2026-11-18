@@ -3,6 +3,8 @@ import hmac
 import os
 import secrets
 from datetime import timedelta
+from django.conf import settings
+from django.core.mail import send_mail
 from django.db import transaction
 from django.utils import timezone
 from rest_framework import permissions, status
@@ -11,53 +13,67 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from apps.accounts.models import UserAccount
 from .models import OTPVerification, RegistrationRequest, UserRecord
-from .sms import send_otp_sms
 
 
-def _hash_otp(mobile: str, otp: str) -> str:
+def _hash_otp(email: str, otp: str) -> str:
     pepper = os.environ.get("OTP_PEPPER", "secure-qr-otp-pepper").encode()
-    return hmac.new(pepper, f"{mobile}:{otp}".encode(), hashlib.sha256).hexdigest()
+    return hmac.new(pepper, f"{email.strip().lower()}:{otp}".encode(), hashlib.sha256).hexdigest()
 
 
 class SendOtpView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def post(self, request):
-        mobile = str(request.data.get("mobile", "")).strip()
+        email = str(request.data.get("email", "")).strip().lower()
         purpose = str(request.data.get("purpose", "REGISTRATION")).upper()
-        if not mobile:
+        if not email or "@" not in email:
             return Response(
-                {"error": "Please enter a valid mobile number."},
+                {"error": "Please enter a valid email address."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        if purpose == "REGISTRATION" and UserAccount.objects.filter(mobile=mobile).exists():
+        if purpose == "REGISTRATION" and UserAccount.objects.filter(email__iexact=email).exists():
             return Response(
-                {"error": "This mobile number is already registered."},
+                {"error": "This email address is already registered."},
                 status=status.HTTP_409_CONFLICT,
             )
 
-        cutoff = timezone.now() - timedelta(minutes=30)
-        recent = OTPVerification.objects.filter(mobile=mobile, created_at__gte=cutoff).order_by("-id")
-        is_resend = recent.exists()
-
         otp = f"{secrets.randbelow(900000) + 100000}"
         otp_rec = OTPVerification.objects.create(
-            mobile=mobile,
+            email=email,
+            mobile="",
             purpose=purpose,
-            otp_hash=_hash_otp(mobile, otp),
+            otp_hash=_hash_otp(email, otp),
             expires_at=timezone.now() + timedelta(minutes=5),
             ip_address=request.META.get("REMOTE_ADDR"),
         )
-        sms_result = send_otp_sms(mobile, otp, is_resend=is_resend)
+        dispatched = False
+        email_error = None
+        try:
+            send_mail(
+                subject="Your Secure QR Verification Code",
+                message=f"Your Secure QR verification code is {otp}. It expires in 5 minutes.",
+                from_email=settings.DEFAULT_FROM_EMAIL,
+                recipient_list=[email],
+                fail_silently=False,
+            )
+            dispatched = True
+        except Exception as exc:
+            email_error = str(exc)
+
         return Response(
             {
                 "otpRequestId": otp_rec.id,
-                "mobile": mobile,
+                "email": email,
                 "expiresInSeconds": 300,
-                "smsProvider": sms_result.get("provider"),
-                "smsDispatched": sms_result.get("dispatched", False),
-                "message": "Verification code sent to your mobile number.",
+                "emailProvider": "gmail-smtp" if dispatched else "console",
+                "emailDispatched": dispatched,
+                "emailError": email_error,
+                "message": (
+                    f"Verification code sent to {email}."
+                    if dispatched
+                    else f"Verification code created, but email could not be delivered ({email_error or 'SMTP unavailable'})."
+                ),
             }
         )
 
@@ -66,9 +82,9 @@ class VerifyOtpView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def post(self, request):
-        mobile = str(request.data.get("mobile", "")).strip()
+        email = str(request.data.get("email", "")).strip().lower()
         otp = str(request.data.get("otp", "")).strip()
-        latest = OTPVerification.objects.filter(mobile=mobile, used_at__isnull=True).order_by("-id").first()
+        latest = OTPVerification.objects.filter(email__iexact=email, used_at__isnull=True).order_by("-id").first()
         if not latest:
             return Response({"error": "No active verification code found."}, status=status.HTTP_400_BAD_REQUEST)
         if latest.expires_at < timezone.now():
@@ -76,7 +92,7 @@ class VerifyOtpView(APIView):
         if latest.attempts >= latest.max_attempts:
             return Response({"error": "Too many incorrect attempts."}, status=status.HTTP_429_TOO_MANY_REQUESTS)
 
-        if not hmac.compare_digest(latest.otp_hash, _hash_otp(mobile, otp)):
+        if not hmac.compare_digest(latest.otp_hash, _hash_otp(email, otp)):
             latest.attempts += 1
             latest.save(update_fields=["attempts"])
             return Response({"error": "Incorrect verification code."}, status=status.HTTP_400_BAD_REQUEST)
@@ -98,12 +114,12 @@ class RegisterUserView(APIView):
         otp_id = data.get("otpVerificationId")
 
         otp_rec = OTPVerification.objects.filter(
-            id=otp_id, mobile=mobile, verified_at__isnull=False, used_at__isnull=True
+            id=otp_id, email__iexact=email, verified_at__isnull=False, used_at__isnull=True
         ).first()
         if not otp_rec:
-            return Response({"error": "Please verify your mobile number via SMS first."}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"error": "Please verify your email address with the one-time code first."}, status=status.HTTP_400_BAD_REQUEST)
 
-        if UserAccount.objects.filter(email=email).exists() or UserAccount.objects.filter(mobile=mobile).exists():
+        if UserAccount.objects.filter(email__iexact=email).exists() or UserAccount.objects.filter(mobile=mobile).exists():
             return Response({"error": "An account with this email or mobile already exists."}, status=status.HTTP_409_CONFLICT)
 
         now = timezone.now()
@@ -116,7 +132,8 @@ class RegisterUserView(APIView):
                 mobile=mobile,
                 password=password,
                 role="USER",
-                is_mobile_verified=True,
+                is_mobile_verified=False,
+                is_email_verified=True,
             )
             reg_id = f"SQR-{now.year}-{100000 + user.id:06d}"
             # STORAGES["default"] automatically stores profile_photo & id_proof_document in AWS S3 (sathayush/photos/ and sathayush/id_proofs/)
@@ -141,7 +158,7 @@ class RegisterUserView(APIView):
                 user_record=rec,
                 request_type="INITIAL",
                 status="PENDING",
-                notes="Application submitted with verified mobile number.",
+                notes="Application submitted with verified email OTP.",
             )
 
         return Response(

@@ -90,7 +90,7 @@ import {DynamicFieldConfig} from '../../core/models/types';
               Member Sign-Up
             </h1>
             <p class="mt-1 text-sm text-slate-600">
-              Share your contact details, confirm your phone number via SMS, and upload a photo and ID document for quick team approval.
+              Share your contact details, verify your email address with a one-time code, and upload a photo and ID document for quick team approval.
             </p>
           </div>
 
@@ -121,11 +121,29 @@ import {DynamicFieldConfig} from '../../core/models/types';
                     type="email"
                     formControlName="email"
                     (blur)="checkDuplicates()"
+                    [readonly]="Boolean(otpVerifiedId())"
                     placeholder="name@organization.org"
-                    class="w-full h-11 rounded-lg border border-slate-300 px-3.5 text-sm text-slate-900 focus:border-[#0F172A] focus:outline-none"
+                    class="w-full h-11 rounded-lg border border-slate-300 px-3.5 text-sm text-slate-900 focus:border-[#0F172A] focus:outline-none read-only:bg-slate-100"
                   />
                   @if (emailTaken()) {
                     <p class="mt-1 text-xs font-medium text-red-600">This email is already registered.</p>
+                  }
+                </div>
+
+                <div>
+                  <label for="reg-mobile" class="block text-xs font-semibold text-slate-700 mb-1.5">
+                    Mobile Number (Contact) <span class="text-red-600">*</span>
+                  </label>
+                  <input
+                    id="reg-mobile"
+                    type="tel"
+                    formControlName="mobile"
+                    (blur)="checkDuplicates()"
+                    placeholder="+15550192834"
+                    class="w-full h-11 rounded-lg border border-slate-300 px-3.5 font-mono text-sm text-slate-900 focus:border-[#0F172A] focus:outline-none"
+                  />
+                  @if (mobileTaken()) {
+                    <p class="mt-1 text-xs font-medium text-red-600">This mobile number is already registered.</p>
                   }
                 </div>
 
@@ -172,70 +190,62 @@ import {DynamicFieldConfig} from '../../core/models/types';
               </div>
             </section>
 
-            <!-- Section 2: Mobile OTP Verification -->
+            <!-- Section 2: Email OTP Verification -->
             <section class="rounded-xl border border-slate-200 bg-white p-5 sm:p-6">
               <div class="flex flex-wrap items-center justify-between gap-2">
-                <h2 class="text-base font-bold text-[#0F172A] font-display">02. Mobile OTP Verification</h2>
+                <h2 class="text-base font-bold text-[#0F172A] font-display">02. Email OTP Verification</h2>
                 @if (otpVerifiedId()) {
                   <span class="inline-flex items-center gap-1.5 text-xs font-semibold text-emerald-700">
                     <mat-icon class="text-[16px]!">verified</mat-icon>
-                    <span>Mobile Verified</span>
+                    <span>Email Verified</span>
                   </span>
                 }
               </div>
 
-              <div class="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-12 sm:items-end">
-                <div class="sm:col-span-6">
-                  <label for="reg-mobile" class="block text-xs font-semibold text-slate-700 mb-1.5">
-                    Mobile Number (with country code) <span class="text-red-600">*</span>
-                  </label>
-                  <input
-                    id="reg-mobile"
-                    type="tel"
-                    formControlName="mobile"
-                    (blur)="checkDuplicates()"
-                    [readonly]="Boolean(otpVerifiedId())"
-                    placeholder="+15550192834"
-                    class="w-full h-11 rounded-lg border border-slate-300 px-3.5 font-mono text-sm text-slate-900 focus:border-[#0F172A] focus:outline-none read-only:bg-slate-100"
-                  />
-                  @if (mobileTaken()) {
-                    <p class="mt-1 text-xs font-medium text-red-600">This mobile number is already registered.</p>
-                  }
+              <div class="mt-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between rounded-lg border border-slate-200 bg-slate-50 px-4 py-3">
+                <div class="min-w-0">
+                  <p class="text-xs font-semibold text-slate-700">Verification Email Recipient</p>
+                  <p class="mt-0.5 font-mono text-xs text-slate-600 truncate">
+                    {{ form.value.email || 'Enter your email address in Section 01 above' }}
+                  </p>
                 </div>
 
-                <div class="sm:col-span-6">
-                  @if (!otpVerifiedId()) {
-                    <button
-                      type="button"
-                      (click)="sendOtp()"
-                      [disabled]="sendingOtp() || resendCooldown() > 0 || mobileTaken()"
-                      class="touch-target w-full sm:w-auto inline-flex items-center justify-center gap-2 rounded-lg bg-[#1E3A5F] px-4 py-2.5 text-xs font-semibold text-white hover:bg-[#0F172A] disabled:opacity-50 whitespace-nowrap"
-                    >
-                      <mat-icon class="text-[18px]!">sms</mat-icon>
-                      @if (resendCooldown() > 0) {
-                        <span>Resend in {{ resendCooldown() }}s</span>
-                      } @else if (otpSent()) {
-                        <span>Resend OTP</span>
-                      } @else {
-                        <span>Send Verification OTP</span>
-                      }
-                    </button>
-                  }
-                </div>
+                @if (!otpVerifiedId()) {
+                  <button
+                    type="button"
+                    (click)="sendOtp()"
+                    [disabled]="sendingOtp() || resendCooldown() > 0 || emailTaken()"
+                    class="touch-target w-full sm:w-auto inline-flex items-center justify-center gap-2 rounded-lg bg-[#1E3A5F] px-4 py-2.5 text-xs font-semibold text-white hover:bg-[#0F172A] disabled:opacity-50 whitespace-nowrap"
+                  >
+                    <mat-icon class="text-[18px]!">mail</mat-icon>
+                    @if (resendCooldown() > 0) {
+                      <span>Resend in {{ resendCooldown() }}s</span>
+                    } @else if (otpSent()) {
+                      <span>Resend Email OTP</span>
+                    } @else {
+                      <span>Send Email OTP</span>
+                    }
+                  </button>
+                }
               </div>
 
               @if (otpSent() && !otpVerifiedId()) {
-                <div class="mt-4 rounded-lg border border-slate-200 bg-slate-50 p-4">
+                <div class="mt-4 rounded-lg border border-slate-200 bg-slate-50 p-4 space-y-2">
+                  @if (emailNotice()) {
+                    <p class="text-xs font-medium text-slate-700">
+                      {{ emailNotice() }}
+                    </p>
+                  }
                   @if (devOtpHint()) {
-                    <p class="mb-3 text-xs text-slate-700">
-                      Development SMS Gateway Code:
+                    <p class="text-xs text-slate-700">
+                      Fallback Verification Code:
                       <span class="font-mono font-bold text-[#0F172A]">{{ devOtpHint() }}</span>
                     </p>
                   }
                   <div class="flex flex-col gap-3 sm:flex-row sm:items-end">
                     <div class="flex-1 max-w-xs">
                       <label for="reg-otp" class="block text-xs font-semibold text-slate-700 mb-1.5">
-                        Enter 6-Digit OTP
+                        Enter 6-Digit Email Code
                       </label>
                       <input
                         id="reg-otp"
@@ -253,7 +263,7 @@ import {DynamicFieldConfig} from '../../core/models/types';
                       class="touch-target inline-flex items-center justify-center gap-2 rounded-lg bg-emerald-700 px-5 py-2.5 text-xs font-semibold text-white hover:bg-emerald-800 disabled:opacity-50 whitespace-nowrap"
                     >
                       <mat-icon class="text-[18px]!">check_circle</mat-icon>
-                      <span>{{ verifyingOtp() ? 'Verifying...' : 'Verify OTP' }}</span>
+                      <span>{{ verifyingOtp() ? 'Verifying...' : 'Verify Email Code' }}</span>
                     </button>
                   </div>
                 </div>
@@ -488,6 +498,7 @@ export class Register implements OnInit {
   protected readonly verifyingOtp = signal(false);
   protected readonly otpVerifiedId = signal<number | null>(null);
   protected readonly devOtpHint = signal<string | null>(null);
+  protected readonly emailNotice = signal<string | null>(null);
   protected readonly resendCooldown = signal(0);
 
   protected readonly photoPreview = signal<string | null>(null);
@@ -556,20 +567,29 @@ export class Register implements OnInit {
   }
 
   async sendOtp(): Promise<void> {
-    const mobile = (this.form.value.mobile || '').trim();
-    if (!/^\+?[0-9]{8,16}$/.test(mobile)) {
-      this.toast.error('Invalid Mobile', 'Enter a valid mobile number (8-16 digits, optional +).');
+    const email = (this.form.value.email || '').trim().toLowerCase();
+    if (!/^\S+@\S+\.\S+$/.test(email)) {
+      this.toast.error('Invalid Email', 'Enter a valid email address in Section 01 first.');
       return;
     }
     this.sendingOtp.set(true);
+    this.emailNotice.set(null);
     try {
-      const res = await firstValueFrom(this.api.sendOtp(mobile, 'REGISTRATION'));
+      const res = await firstValueFrom(this.api.sendOtp(email, 'REGISTRATION'));
       this.otpSent.set(true);
-      this.devOtpHint.set(res.devOtpHint || null);
-      this.toast.success('OTP Sent', `Verification code sent to ${mobile}.`);
+      this.devOtpHint.set(!res.emailDispatched && res.devOtpHint ? res.devOtpHint : null);
+      if (res.emailDispatched) {
+        const notice = `A 6-digit verification code has been sent to ${email}. Check your inbox or spam folder.`;
+        this.emailNotice.set(notice);
+        this.toast.success('Email OTP Sent', `Verification code sent to ${email}.`);
+      } else {
+        const notice = `Could not deliver verification email (${res.emailError || 'SMTP unavailable'}).`;
+        this.emailNotice.set(notice);
+        this.toast.error('Email Delivery Notice', notice);
+      }
       this.startCooldown(30);
     } catch (err: unknown) {
-      const msg = (err as {error?: {error?: string}})?.error?.error || 'Could not send OTP.';
+      const msg = (err as {error?: {error?: string}})?.error?.error || 'Could not send email OTP.';
       this.toast.error('OTP Error', msg);
     } finally {
       this.sendingOtp.set(false);
@@ -577,21 +597,21 @@ export class Register implements OnInit {
   }
 
   async verifyOtp(): Promise<void> {
-    const mobile = (this.form.value.mobile || '').trim();
+    const email = (this.form.value.email || '').trim().toLowerCase();
     const otp = (this.form.value.otpCode || '').trim();
     if (!/^\d{6}$/.test(otp)) {
-      this.toast.error('Invalid Code', 'Enter the 6-digit numeric OTP.');
+      this.toast.error('Invalid Code', 'Enter the 6-digit numeric verification code.');
       return;
     }
     this.verifyingOtp.set(true);
     try {
-      const res = await firstValueFrom(this.api.verifyOtp(mobile, otp));
+      const res = await firstValueFrom(this.api.verifyOtp(email, otp));
       if (res.verified) {
         this.otpVerifiedId.set(res.otpVerificationId);
-        this.toast.success('Mobile Verified', 'Your mobile number has been verified.');
+        this.toast.success('Email Verified', 'Your email address has been verified.');
       }
     } catch (err: unknown) {
-      const msg = (err as {error?: {error?: string}})?.error?.error || 'OTP verification failed.';
+      const msg = (err as {error?: {error?: string}})?.error?.error || 'Email verification failed.';
       this.toast.error('Verification Failed', msg);
     } finally {
       this.verifyingOtp.set(false);
@@ -633,7 +653,7 @@ export class Register implements OnInit {
       return;
     }
     if (!this.otpVerifiedId()) {
-      this.errorMsg.set('Please verify your mobile number via OTP before submitting.');
+      this.errorMsg.set('Please verify your email address via OTP before submitting.');
       return;
     }
     if (!this.photoData()) {

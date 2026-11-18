@@ -64,6 +64,7 @@ export interface UserRecord {
   updated_at: string;
   is_active: number;
   is_mobile_verified: number;
+  is_email_verified?: number;
   latest_qr_status?: QRStatus | null;
   latest_qr_expires_at?: string | null;
 }

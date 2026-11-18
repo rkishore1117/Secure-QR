@@ -111,60 +111,6 @@ import {ToastService} from '../../core/services/toast.service';
               <span>{{ loading() ? 'Signing In...' : 'Sign In' }}</span>
             </button>
           </form>
-
-          <!-- Seeded Test Accounts Helper -->
-          <div class="mt-6 border-t border-slate-200 pt-5">
-            <p class="text-[11px] font-semibold text-slate-500 mb-2.5">
-              Seeded Evaluation Accounts (Database-Backed)
-            </p>
-            @if (portalMode() === 'ADMIN') {
-              <div class="grid grid-cols-1 gap-2 sm:grid-cols-2">
-                <button
-                  type="button"
-                  (click)="fillIdentifier('kishore.sathayush@gmail.com')"
-                  class="touch-target sm:col-span-2 rounded-lg border border-slate-300 bg-slate-50 px-3 py-2 text-left hover:bg-slate-100"
-                >
-                  <p class="text-xs font-semibold text-[#0F172A]">Fixed Primary Super Admin (Enter Password)</p>
-                  <p class="font-mono text-[11px] text-slate-600 truncate">kishore.sathayush@gmail.com</p>
-                </button>
-                <button
-                  type="button"
-                  (click)="fillDemo('superadmin@secureqr.gov', 'SuperAdmin@2026!')"
-                  class="touch-target rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-left hover:bg-slate-100"
-                >
-                  <p class="text-xs font-semibold text-[#0F172A]">Demo Super Admin</p>
-                  <p class="font-mono text-[11px] text-slate-500 truncate">superadmin@secureqr.gov</p>
-                </button>
-                <button
-                  type="button"
-                  (click)="fillDemo('admin.verifier@secureqr.gov', 'Verifier@2026!')"
-                  class="touch-target rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-left hover:bg-slate-100"
-                >
-                  <p class="text-xs font-semibold text-[#0F172A]">Verifier Admin</p>
-                  <p class="font-mono text-[11px] text-slate-500 truncate">admin.verifier@secureqr.gov</p>
-                </button>
-              </div>
-            } @else {
-              <div class="grid grid-cols-1 gap-2 sm:grid-cols-2">
-                <button
-                  type="button"
-                  (click)="fillDemo('aarav.sharma@enterprise.org', 'Member@2026!')"
-                  class="touch-target rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-left hover:bg-slate-100"
-                >
-                  <p class="text-xs font-semibold text-emerald-700">Approved Member</p>
-                  <p class="font-mono text-[11px] text-slate-500 truncate">aarav.sharma@enterprise.org</p>
-                </button>
-                <button
-                  type="button"
-                  (click)="fillDemo('sofia.rodriguez@civicgrid.org', 'Member@2026!')"
-                  class="touch-target rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-left hover:bg-slate-100"
-                >
-                  <p class="text-xs font-semibold text-blue-700">Resubmit Member</p>
-                  <p class="font-mono text-[11px] text-slate-500 truncate">sofia.rodriguez@civicgrid.org</p>
-                </button>
-              </div>
-            }
-          </div>
         </div>
       </main>
     </div>
@@ -195,14 +141,6 @@ export class Login implements OnInit {
   switchMode(mode: 'USER' | 'ADMIN'): void {
     this.portalMode.set(mode);
     this.errorMsg.set(null);
-  }
-
-  fillIdentifier(email: string): void {
-    this.form.patchValue({identifier: email, password: ''});
-  }
-
-  fillDemo(email: string, password: string): void {
-    this.form.patchValue({identifier: email, password});
   }
 
   async submit(): Promise<void> {

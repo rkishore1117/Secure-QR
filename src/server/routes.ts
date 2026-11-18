@@ -2,10 +2,19 @@ import express, {type Request, type Response, type NextFunction} from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
 import QRCode from 'qrcode';
-import {getDb, getUploadsDir, withTransaction} from './db';
+import {
+  ensureSeeded,
+  executeSql,
+  getMysqlConfig,
+  getUploadsDir,
+  parseJsonSafe,
+  queryOne,
+  queryRows,
+  toMysqlDateTime,
+  withTransaction,
+} from './db';
 import {buildVerifiedUsersWorkbook} from './excel';
-import {dispatchOtpSms} from './sms';
-import {sendDailyVerificationExcelReport} from './mailer';
+import {sendDailyVerificationExcelReport, sendVerificationOtpEmail} from './mailer';
 import {checkMysqlConnection, ensureMysqlDatabaseAndSchema} from './mysql-connector';
 import {uploadBase64Media} from './s3-storage';
 import {
@@ -60,28 +69,39 @@ function getBaseUrl(req: Request): string {
   return `${proto}://${host}`;
 }
 
-function getSetting(key: string, fallback: string): string {
-  const row = getDb()
-    .prepare('SELECT value FROM system_settings WHERE key = ?')
-    .get(key) as {value: string} | undefined;
+function toMysqlDate(val: unknown): string | null {
+  if (!val) return null;
+  if (val instanceof Date) {
+    return Number.isNaN(val.getTime()) ? null : val.toISOString().slice(0, 10);
+  }
+  const str = String(val).trim();
+  if (!str) return null;
+  if (/^\d{4}-\d{2}-\d{2}/.test(str)) return str.slice(0, 10);
+  const parsed = new Date(str);
+  return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString().slice(0, 10);
+}
+
+async function getSetting(key: string, fallback: string): Promise<string> {
+  const row = await queryOne<{value: string}>(
+    'SELECT `value` AS `value` FROM system_settings WHERE `key` = ?',
+    [key],
+  );
   return row ? row.value : fallback;
 }
 
-function writeAuditLog(
+async function writeAuditLog(
   actor: {id?: number | null; email: string; role: string},
   action: string,
   targetType: string,
   targetId: string | number | null,
   details: Record<string, unknown>,
   ip?: string,
-): void {
-  getDb()
-    .prepare(
-      `INSERT INTO admin_activity_logs
-        (actor_user_id, actor_email, actor_role, action, target_type, target_id, details_json, ip_address, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    )
-    .run(
+): Promise<void> {
+  await executeSql(
+    `INSERT INTO admin_activity_logs
+      (actor_user_id, actor_email, actor_role, action, target_type, target_id, details_json, ip_address, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
       actor.id ?? null,
       actor.email,
       actor.role,
@@ -90,11 +110,12 @@ function writeAuditLog(
       targetId !== null ? String(targetId) : null,
       JSON.stringify(details),
       ip ?? null,
-      new Date().toISOString(),
-    );
+      toMysqlDateTime(),
+    ],
+  );
 }
 
-function createNotification(params: {
+async function createNotification(params: {
   recipientUserId?: number | null;
   recipientRole?: 'ADMIN' | 'SUPER_ADMIN' | null;
   type: string;
@@ -102,15 +123,15 @@ function createNotification(params: {
   message: string;
   linkPath?: string;
   metadata?: Record<string, unknown>;
-}): void {
-  const now = new Date().toISOString();
-  const res = getDb()
-    .prepare(
-      `INSERT INTO notifications
-        (recipient_user_id, recipient_role, type, title, message, link_path, metadata_json, is_read, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)`,
-    )
-    .run(
+}): Promise<void> {
+  const nowObj = new Date();
+  const nowMysql = toMysqlDateTime(nowObj);
+  const nowIso = nowObj.toISOString();
+  const res = await executeSql(
+    `INSERT INTO notifications
+      (recipient_user_id, recipient_role, type, title, message, link_path, metadata_json, is_read, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)`,
+    [
       params.recipientUserId ?? null,
       params.recipientRole ?? null,
       params.type,
@@ -118,20 +139,21 @@ function createNotification(params: {
       params.message,
       params.linkPath ?? null,
       JSON.stringify(params.metadata ?? {}),
-      now,
-    );
+      nowMysql,
+    ],
+  );
 
   const payload = {
     event: 'notification',
     notification: {
-      id: Number(res.lastInsertRowid),
+      id: Number(res.insertId),
       type: params.type,
       title: params.title,
       message: params.message,
       linkPath: params.linkPath ?? null,
       metadata: params.metadata ?? {},
       isRead: false,
-      createdAt: now,
+      createdAt: nowIso,
     },
   };
 
@@ -153,53 +175,68 @@ async function saveBase64Upload(
   return result.url;
 }
 
-function requireAuth(req: AuthenticatedRequest, res: Response, next: NextFunction): void {
-  const header = req.headers.authorization;
-  if (!header || !header.startsWith('Bearer ')) {
-    res.status(401).json({error: 'Authentication required.'});
-    return;
-  }
-  const token = header.slice(7).trim();
-  const decoded = verifyAccessToken(token);
-  if (!decoded) {
-    res.status(401).json({error: 'Invalid or expired access token.'});
-    return;
-  }
+async function requireAuth(
+  req: AuthenticatedRequest,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const header = req.headers.authorization;
+    if (!header || !header.startsWith('Bearer ')) {
+      res.status(401).json({error: 'Authentication required.'});
+      return;
+    }
+    const token = header.slice(7).trim();
+    const decoded = verifyAccessToken(token);
+    if (!decoded) {
+      res.status(401).json({error: 'Invalid or expired access token.'});
+      return;
+    }
 
-  const user = getDb()
-    .prepare('SELECT id, email, role, is_active, deleted_at FROM user_accounts WHERE id = ?')
-    .get(decoded.sub) as
-    | {id: number; email: string; role: 'SUPER_ADMIN' | 'ADMIN' | 'USER'; is_active: number; deleted_at: string | null}
-    | undefined;
+    const user = await queryOne<{
+      id: number;
+      email: string;
+      role: 'SUPER_ADMIN' | 'ADMIN' | 'USER';
+      is_active: number;
+      deleted_at: Date | string | null;
+    }>('SELECT id, email, role, is_active, deleted_at FROM user_accounts WHERE id = ?', [
+      decoded.sub,
+    ]);
 
-  if (!user || !user.is_active || user.deleted_at) {
-    res.status(403).json({error: 'Account is inactive or archived.'});
-    return;
+    if (!user || !user.is_active || user.deleted_at) {
+      res.status(403).json({error: 'Account is inactive or archived.'});
+      return;
+    }
+
+    let permissions: string[] = [];
+    if (user.role === 'SUPER_ADMIN') {
+      permissions = [
+        'can_view_registrations',
+        'can_approve_registrations',
+        'can_manage_qr',
+        'can_scan_qr',
+        'can_export_excel',
+        'can_manage_users',
+      ];
+    } else if (user.role === 'ADMIN') {
+      const adminProfile = await queryOne<{permissions_json: unknown}>(
+        'SELECT permissions_json FROM admin_profiles WHERE user_id = ?',
+        [user.id],
+      );
+      permissions = adminProfile ? parseJsonSafe<string[]>(adminProfile.permissions_json, []) : [];
+    }
+
+    req.auth = {
+      ...decoded,
+      role: user.role,
+      permissions,
+    };
+    next();
+  } catch (err) {
+    res.status(500).json({
+      error: err instanceof Error ? err.message : 'Database authentication check failed.',
+    });
   }
-
-  let permissions: string[] = [];
-  if (user.role === 'SUPER_ADMIN') {
-    permissions = [
-      'can_view_registrations',
-      'can_approve_registrations',
-      'can_manage_qr',
-      'can_scan_qr',
-      'can_export_excel',
-      'can_manage_users',
-    ];
-  } else if (user.role === 'ADMIN') {
-    const adminProfile = getDb()
-      .prepare('SELECT permissions_json FROM admin_profiles WHERE user_id = ?')
-      .get(user.id) as {permissions_json: string} | undefined;
-    permissions = adminProfile ? (JSON.parse(adminProfile.permissions_json) as string[]) : [];
-  }
-
-  req.auth = {
-    ...decoded,
-    role: user.role,
-    permissions,
-  };
-  next();
 }
 
 function requireAdmin(req: AuthenticatedRequest, res: Response, next: NextFunction): void {
@@ -263,8 +300,8 @@ async function generateAndSaveQr(
   issuedAt: string;
   expiresAt: string;
 }> {
-  const validityDays = Number.parseInt(getSetting('qr_validity_days', '365'), 10) || 365;
-  const allowMultiple = getSetting('allow_multiple_active_qr', 'false') === 'true';
+  const validityDays = Number.parseInt(await getSetting('qr_validity_days', '365'), 10) || 365;
+  const allowMultiple = (await getSetting('allow_multiple_active_qr', 'false')) === 'true';
 
   const rawToken = generateSecureQrToken();
   const tokenHash = sha256Hex(rawToken);
@@ -278,36 +315,39 @@ async function generateAndSaveQr(
   });
 
   const now = new Date();
-  const issuedAt = now.toISOString();
-  const expiresAt = new Date(now.getTime() + validityDays * 86400000).toISOString();
+  const issuedAtIso = now.toISOString();
+  const expiresDate = new Date(now.getTime() + validityDays * 86400000);
+  const expiresAtIso = expiresDate.toISOString();
+  const issuedAtMysql = toMysqlDateTime(now);
+  const expiresAtMysql = toMysqlDateTime(expiresDate);
 
-  const qrId = withTransaction((tx) => {
+  const qrId = await withTransaction(async (tx) => {
     if (!allowMultiple) {
-      tx.prepare(
+      await tx.executeSql(
         `UPDATE qr_codes
          SET status = 'REVOKED', revoked_at = ?, revoked_by = ?, revoke_reason = 'Superseded by newly issued QR credential'
          WHERE user_record_id = ? AND status = 'ACTIVE'`,
-      ).run(issuedAt, issuedByAdminId, userRecordId);
+        [issuedAtMysql, issuedByAdminId, userRecordId],
+      );
     }
 
-    const res = tx
-      .prepare(
-        `INSERT INTO qr_codes
-          (user_record_id, token_hash, token_prefix, verification_url, qr_png_data_url, status, issued_at, expires_at, issued_by)
-         VALUES (?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?)`,
-      )
-      .run(
+    const res = await tx.executeSql(
+      `INSERT INTO qr_codes
+        (user_record_id, token_hash, token_prefix, verification_url, qr_png_data_url, status, issued_at, expires_at, issued_by)
+       VALUES (?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?)`,
+      [
         userRecordId,
         tokenHash,
         tokenPrefix,
         verificationUrl,
         qrPngDataUrl,
-        issuedAt,
-        expiresAt,
+        issuedAtMysql,
+        expiresAtMysql,
         issuedByAdminId,
-      );
+      ],
+    );
 
-    return Number(res.lastInsertRowid);
+    return Number(res.insertId);
   });
 
   return {
@@ -316,15 +356,15 @@ async function generateAndSaveQr(
     verificationUrl,
     qrPngDataUrl,
     status: 'ACTIVE',
-    issuedAt,
-    expiresAt,
+    issuedAt: issuedAtIso,
+    expiresAt: expiresAtIso,
   };
 }
 
 export function createApiRouter(): express.Router {
   const router = express.Router();
 
-  // Serve uploaded files safely (prevent path traversal)
+  // Serve uploaded fallback files safely (prevent path traversal)
   router.get('/uploads/:filename', (req: Request, res: Response) => {
     const filename = path.basename(String(req.params['filename'] || ''));
     const fullPath = path.join(getUploadsDir(), filename);
@@ -335,13 +375,21 @@ export function createApiRouter(): express.Router {
     res.sendFile(fullPath);
   });
 
+  // Ensure MySQL RDS schema & seed data are ready before serving API routes
+  router.use(async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      await ensureSeeded(getBaseUrl(req));
+      next();
+    } catch (err) {
+      res.status(503).json({
+        error: err instanceof Error ? err.message : 'Database connection unavailable.',
+      });
+    }
+  });
+
   // Public field configuration & settings
-  router.get('/public/field-configs', (_req: Request, res: Response) => {
-    const rows = getDb()
-      .prepare(
-        'SELECT * FROM user_field_configs WHERE is_enabled = 1 ORDER BY sort_order ASC, id ASC',
-      )
-      .all() as {
+  router.get('/public/field-configs', async (_req: Request, res: Response) => {
+    const rows = await queryRows<{
       id: number;
       field_key: string;
       label: string;
@@ -349,13 +397,13 @@ export function createApiRouter(): express.Router {
       is_required: number;
       is_enabled: number;
       is_editable_on_resubmit: number;
-      options_json: string;
+      options_json: unknown;
       sort_order: number;
-    }[];
+    }>('SELECT * FROM user_field_configs WHERE is_enabled = 1 ORDER BY sort_order ASC, id ASC');
 
     res.json({
-      organizationName: getSetting('organization_name', 'Secure QR Verification Authority'),
-      idProofRequired: getSetting('id_proof_required', 'true') === 'true',
+      organizationName: await getSetting('organization_name', 'Secure QR Verification Authority'),
+      idProofRequired: (await getSetting('id_proof_required', 'true')) === 'true',
       fields: rows.map((r) => ({
         id: r.id,
         fieldKey: r.field_key,
@@ -363,14 +411,14 @@ export function createApiRouter(): express.Router {
         fieldType: r.field_type,
         isRequired: Boolean(r.is_required),
         isEditableOnResubmit: Boolean(r.is_editable_on_resubmit),
-        options: JSON.parse(r.options_json) as string[],
+        options: parseJsonSafe<string[]>(r.options_json, []),
         sortOrder: r.sort_order,
       })),
     });
   });
 
   // Public non-PII verification status check (never exposes user PII!)
-  router.get('/public/verify-info', (req: Request, res: Response) => {
+  router.get('/public/verify-info', async (req: Request, res: Response) => {
     const tokenParam = String(req.query['token'] || '');
     if (!tokenParam) {
       res.status(400).json({status: 'INVALID', message: 'Verification token is missing.'});
@@ -378,24 +426,21 @@ export function createApiRouter(): express.Router {
     }
     const rawToken = extractTokenFromInput(tokenParam);
     const tokenHash = sha256Hex(rawToken);
-    const qr = getDb()
-      .prepare(
-        `SELECT q.status, q.expires_at, q.issued_at, ur.approval_status, ua.is_active, ua.deleted_at
-         FROM qr_codes q
-         JOIN user_records ur ON ur.id = q.user_record_id
-         JOIN user_accounts ua ON ua.id = ur.user_id
-         WHERE q.token_hash = ?`,
-      )
-      .get(tokenHash) as
-      | {
-          status: string;
-          expires_at: string;
-          issued_at: string;
-          approval_status: string;
-          is_active: number;
-          deleted_at: string | null;
-        }
-      | undefined;
+    const qr = await queryOne<{
+      status: string;
+      expires_at: Date | string;
+      issued_at: Date | string;
+      approval_status: string;
+      is_active: number;
+      deleted_at: Date | string | null;
+    }>(
+      `SELECT q.status, q.expires_at, q.issued_at, ur.approval_status, ua.is_active, ua.deleted_at
+       FROM qr_codes q
+       JOIN user_records ur ON ur.id = q.user_record_id
+       JOIN user_accounts ua ON ua.id = ur.user_id
+       WHERE q.token_hash = ?`,
+      [tokenHash],
+    );
 
     if (!qr) {
       res.json({
@@ -437,59 +482,55 @@ export function createApiRouter(): express.Router {
   });
 
   // Duplicate Email / Mobile check
-  router.post('/auth/check-availability', (req: Request, res: Response) => {
+  router.post('/auth/check-availability', async (req: Request, res: Response) => {
     const email = String(req.body?.email || '').trim().toLowerCase();
     const mobile = String(req.body?.mobile || '').trim();
-    const db = getDb();
 
     const emailTaken = email
-      ? Boolean(db.prepare('SELECT id FROM user_accounts WHERE lower(email) = ?').get(email))
+      ? Boolean(await queryOne('SELECT id FROM user_accounts WHERE LOWER(email) = ?', [email]))
       : false;
     const mobileTaken = mobile
-      ? Boolean(db.prepare('SELECT id FROM user_accounts WHERE mobile = ?').get(mobile))
+      ? Boolean(await queryOne('SELECT id FROM user_accounts WHERE mobile = ?', [mobile]))
       : false;
 
     res.json({emailAvailable: !emailTaken, mobileAvailable: !mobileTaken});
   });
 
-  // Send OTP (stored ONLY as HMAC-SHA256 hash)
+  // Send Email OTP (stored ONLY as HMAC-SHA256 hash)
   router.post(
     '/auth/otp/send',
     rateLimit('otp_send', 8, 15 * 60 * 1000),
     async (req: Request, res: Response) => {
-      const mobile = String(req.body?.mobile || '').trim();
+      const email = String(req.body?.email || '').trim().toLowerCase();
       const purpose = String(req.body?.purpose || 'REGISTRATION').toUpperCase();
-      if (!/^\+?[0-9]{8,16}$/.test(mobile)) {
-        res.status(400).json({error: 'Enter a valid mobile number (8-16 digits, optional + prefix).'});
+      if (!/^\S+@\S+\.\S+$/.test(email)) {
+        res.status(400).json({error: 'Enter a valid email address.'});
         return;
       }
 
-      const db = getDb();
       if (purpose === 'REGISTRATION') {
-        const existingMobile = db
-          .prepare('SELECT id FROM user_accounts WHERE mobile = ?')
-          .get(mobile);
-        if (existingMobile) {
-          res.status(409).json({error: 'This mobile number is already registered.'});
+        const existingEmail = await queryOne(
+          'SELECT id FROM user_accounts WHERE LOWER(email) = ?',
+          [email],
+        );
+        if (existingEmail) {
+          res.status(409).json({error: 'This email address is already registered.'});
           return;
         }
       }
 
       // Enforce 30-second resend cooldown & max 5 OTPs per 30 mins
-      const recentOtps = db
-        .prepare(
-          `SELECT id, created_at FROM otp_verifications
-           WHERE mobile = ? AND created_at >= ?
-           ORDER BY id DESC`,
-        )
-        .all(mobile, new Date(Date.now() - 30 * 60 * 1000).toISOString()) as {
-        id: number;
-        created_at: string;
-      }[];
+      const cutoffMysql = toMysqlDateTime(Date.now() - 30 * 60 * 1000);
+      const recentOtps = await queryRows<{id: number; created_at: Date | string}>(
+        `SELECT id, created_at FROM otp_verifications
+         WHERE LOWER(email) = ? AND created_at >= ?
+         ORDER BY id DESC`,
+        [email, cutoffMysql],
+      );
 
       if (recentOtps.length >= 5) {
         res.status(429).json({
-          error: 'OTP resend limit reached for this mobile number. Try again in 30 minutes.',
+          error: 'OTP resend limit reached for this email address. Try again in 30 minutes.',
         });
         return;
       }
@@ -503,77 +544,76 @@ export function createApiRouter(): express.Router {
         }
       }
 
-      const expiryMinutes = Number.parseInt(getSetting('otp_expiry_minutes', '5'), 10) || 5;
-      const maxAttempts = Number.parseInt(getSetting('max_otp_attempts', '5'), 10) || 5;
+      const expiryMinutes = Number.parseInt(await getSetting('otp_expiry_minutes', '5'), 10) || 5;
+      const maxAttempts = Number.parseInt(await getSetting('max_otp_attempts', '5'), 10) || 5;
       const otp = generateNumericOtp();
-      const otpHash = hashOtp(mobile, otp);
+      const otpHash = hashOtp(email, otp);
       const now = new Date();
-      const expiresAt = new Date(now.getTime() + expiryMinutes * 60 * 1000).toISOString();
+      const expiresAtMysql = toMysqlDateTime(now.getTime() + expiryMinutes * 60 * 1000);
 
-      const insertRes = db
-        .prepare(
-          `INSERT INTO otp_verifications
-            (mobile, purpose, otp_hash, expires_at, attempts, max_attempts, ip_address, created_at)
-           VALUES (?, ?, ?, ?, 0, ?, ?, ?)`,
-        )
-        .run(mobile, purpose, otpHash, expiresAt, maxAttempts, req.ip || null, now.toISOString());
+      const insertRes = await executeSql(
+        `INSERT INTO otp_verifications
+          (email, mobile, purpose, otp_hash, expires_at, attempts, max_attempts, ip_address, created_at)
+         VALUES (?, '', ?, ?, ?, 0, ?, ?, ?)`,
+        [email, purpose, otpHash, expiresAtMysql, maxAttempts, req.ip || null, toMysqlDateTime(now)],
+      );
 
       const isResend = recentOtps.length > 0;
-      const smsResult = await dispatchOtpSms(mobile, otp, isResend);
+      const emailResult = await sendVerificationOtpEmail(email, otp, expiryMinutes, isResend);
       const allowDevHint =
         process.env['NODE_ENV'] !== 'production' &&
-        (process.env['ALLOW_DEV_OTP_HINT'] ?? 'true') === 'true';
+        (process.env['ALLOW_DEV_OTP_HINT'] ?? 'true') === 'true' &&
+        (!emailResult.dispatched || Boolean(process.env['VITEST']));
 
-      if (smsResult.provider === 'console' && process.env['NODE_ENV'] !== 'production') {
-        console.log(`[DEV SMS GATEWAY] OTP for ${mobile}: ${otp} (expires in ${expiryMinutes}m)`);
+      if (!emailResult.dispatched && process.env['NODE_ENV'] !== 'production') {
+        console.log(
+          `[EMAIL OTP NOTICE] OTP for ${email}: ${otp} | provider=${emailResult.provider} | err=${emailResult.error || 'none'}`,
+        );
       }
 
       res.json({
-        otpRequestId: Number(insertRes.lastInsertRowid),
-        mobile,
+        otpRequestId: Number(insertRes.insertId),
+        email,
         expiresInSeconds: expiryMinutes * 60,
-        message: smsResult.dispatched
-          ? 'Verification OTP dispatched via SMS gateway.'
-          : 'Verification OTP generated.',
-        smsProvider: smsResult.provider,
-        smsDispatched: smsResult.dispatched,
+        message: emailResult.dispatched
+          ? `Verification code sent to ${email}.`
+          : `Verification code generated, but email could not be delivered (${emailResult.error || 'SMTP unavailable'}).`,
+        emailProvider: emailResult.provider,
+        emailDispatched: emailResult.dispatched,
+        emailError: emailResult.error || null,
         ...(allowDevHint ? {devOtpHint: otp} : {}),
       });
     },
   );
 
-  // Verify OTP
+  // Verify Email OTP
   router.post(
     '/auth/otp/verify',
     rateLimit('otp_verify', 15, 15 * 60 * 1000),
-    (req: Request, res: Response) => {
-      const mobile = String(req.body?.mobile || '').trim();
+    async (req: Request, res: Response) => {
+      const email = String(req.body?.email || '').trim().toLowerCase();
       const otp = String(req.body?.otp || '').trim();
-      if (!mobile || !/^\d{6}$/.test(otp)) {
-        res.status(400).json({error: 'Mobile number and 6-digit OTP are required.'});
+      if (!/^\S+@\S+\.\S+$/.test(email) || !/^\d{6}$/.test(otp)) {
+        res.status(400).json({error: 'Valid email address and 6-digit OTP are required.'});
         return;
       }
 
-      const db = getDb();
-      const latest = db
-        .prepare(
-          `SELECT * FROM otp_verifications
-           WHERE mobile = ? AND used_at IS NULL
-           ORDER BY id DESC LIMIT 1`,
-        )
-        .get(mobile) as
-        | {
-            id: number;
-            otp_hash: string;
-            expires_at: string;
-            attempts: number;
-            max_attempts: number;
-            verified_at: string | null;
-          }
-        | undefined;
+      const latest = await queryOne<{
+        id: number;
+        otp_hash: string;
+        expires_at: Date | string;
+        attempts: number;
+        max_attempts: number;
+        verified_at: Date | string | null;
+      }>(
+        `SELECT * FROM otp_verifications
+         WHERE LOWER(email) = ? AND used_at IS NULL
+         ORDER BY id DESC LIMIT 1`,
+        [email],
+      );
 
       if (!latest) {
-        res.status(400).json({error: 'No active OTP request found. Please request a new OTP.'});
+        res.status(400).json({error: 'No active OTP request found. Please request a new code.'});
         return;
       }
       if (new Date(latest.expires_at).getTime() < Date.now()) {
@@ -585,9 +625,11 @@ export function createApiRouter(): express.Router {
         return;
       }
 
-      const providedHash = hashOtp(mobile, otp);
+      const providedHash = hashOtp(email, otp);
       if (providedHash !== latest.otp_hash) {
-        db.prepare('UPDATE otp_verifications SET attempts = attempts + 1 WHERE id = ?').run(latest.id);
+        await executeSql('UPDATE otp_verifications SET attempts = attempts + 1 WHERE id = ?', [
+          latest.id,
+        ]);
         const remaining = latest.max_attempts - (latest.attempts + 1);
         res.status(400).json({
           error: `Invalid OTP. ${Math.max(remaining, 0)} attempt(s) remaining.`,
@@ -595,13 +637,16 @@ export function createApiRouter(): express.Router {
         return;
       }
 
-      const now = new Date().toISOString();
-      db.prepare('UPDATE otp_verifications SET verified_at = ? WHERE id = ?').run(now, latest.id);
+      const now = new Date();
+      await executeSql('UPDATE otp_verifications SET verified_at = ? WHERE id = ?', [
+        toMysqlDateTime(now),
+        latest.id,
+      ]);
 
       res.json({
         verified: true,
         otpVerificationId: latest.id,
-        verifiedAt: now,
+        verifiedAt: now.toISOString(),
       });
     },
   );
@@ -615,8 +660,8 @@ export function createApiRouter(): express.Router {
       const mobile = String(b.mobile || '').trim();
       const password = String(b.password || '');
       const otpVerificationId = Number(b.otpVerificationId || 0);
-      const dob = b.dob ? String(b.dob).trim() : null;
-      const gender = b.gender ? String(b.gender).trim() : null;
+      const dob = toMysqlDate(b.dob);
+      const gender = b.gender ? String(b.gender).trim() || null : null;
       const address = String(b.address || '').trim();
       const city = String(b.city || '').trim();
       const district = String(b.district || '').trim();
@@ -625,10 +670,23 @@ export function createApiRouter(): express.Router {
       const postalCode = String(b.postalCode || '').trim();
       const idProofType = String(b.idProofType || 'National ID').trim();
       const consentAccepted = Boolean(b.consentAccepted);
-      const dynamicFields = (b.dynamicFields && typeof b.dynamicFields === 'object') ? b.dynamicFields : {};
+      const dynamicFields = b.dynamicFields && typeof b.dynamicFields === 'object' ? b.dynamicFields : {};
 
-      if (!fullName || !email || !mobile || password.length < 8 || !address || !city || !district || !state || !country || !postalCode) {
-        res.status(400).json({error: 'Please fill in all required details and set a password with at least 8 characters.'});
+      if (
+        !fullName ||
+        !email ||
+        !mobile ||
+        password.length < 8 ||
+        !address ||
+        !city ||
+        !district ||
+        !state ||
+        !country ||
+        !postalCode
+      ) {
+        res.status(400).json({
+          error: 'Please fill in all required details and set a password with at least 8 characters.',
+        });
         return;
       }
       if (!consentAccepted) {
@@ -636,27 +694,31 @@ export function createApiRouter(): express.Router {
         return;
       }
       if (!otpVerificationId) {
-        res.status(400).json({error: 'Please verify your mobile number with the SMS code first.'});
+        res.status(400).json({error: 'Please verify your email address with the one-time code first.'});
         return;
       }
 
-      const db = getDb();
-      const otpRec = db
-        .prepare(
-          'SELECT id, mobile, verified_at, used_at FROM otp_verifications WHERE id = ? AND mobile = ?',
-        )
-        .get(otpVerificationId, mobile) as
-        | {id: number; mobile: string; verified_at: string | null; used_at: string | null}
-        | undefined;
+      const otpRec = await queryOne<{
+        id: number;
+        email: string;
+        verified_at: Date | string | null;
+        used_at: Date | string | null;
+      }>(
+        'SELECT id, email, verified_at, used_at FROM otp_verifications WHERE id = ? AND LOWER(email) = ?',
+        [otpVerificationId, email],
+      );
 
       if (!otpRec || !otpRec.verified_at || otpRec.used_at) {
-        res.status(400).json({error: 'Your mobile verification has expired or was already used. Please request a fresh code.'});
+        res.status(400).json({
+          error: 'Your email verification has expired or was already used. Please request a fresh code.',
+        });
         return;
       }
 
-      const dup = db
-        .prepare('SELECT id FROM user_accounts WHERE lower(email) = ? OR mobile = ?')
-        .get(email, mobile);
+      const dup = await queryOne(
+        'SELECT id FROM user_accounts WHERE LOWER(email) = ? OR mobile = ?',
+        [email, mobile],
+      );
       if (dup) {
         res.status(409).json({error: 'An account with this email or mobile number already exists.'});
         return;
@@ -677,36 +739,38 @@ export function createApiRouter(): express.Router {
           ['image/png', 'image/jpeg', 'image/jpg', 'image/webp', 'application/pdf'],
           'idproof',
         );
-      } else if (getSetting('id_proof_required', 'true') === 'true') {
+      } else if ((await getSetting('id_proof_required', 'true')) === 'true') {
         res.status(400).json({error: 'Please upload a photo or PDF of your ID proof.'});
         return;
       }
 
-      const now = new Date().toISOString();
-      const year = new Date().getFullYear();
+      const nowDate = new Date();
+      const nowIso = nowDate.toISOString();
+      const nowMysql = toMysqlDateTime(nowDate);
+      const year = nowDate.getFullYear();
 
-      const result = withTransaction((tx) => {
-        tx.prepare('UPDATE otp_verifications SET used_at = ? WHERE id = ?').run(now, otpRec.id);
+      const result = await withTransaction(async (tx) => {
+        await tx.executeSql('UPDATE otp_verifications SET used_at = ? WHERE id = ?', [
+          nowMysql,
+          otpRec.id,
+        ]);
 
-        const userRes = tx
-          .prepare(
-            `INSERT INTO user_accounts
-              (email, mobile, password_hash, role, is_active, is_mobile_verified, created_at, updated_at)
-             VALUES (?, ?, ?, 'USER', 1, 1, ?, ?)`,
-          )
-          .run(email, mobile, hashPassword(password), now, now);
-        const userId = Number(userRes.lastInsertRowid);
+        const userRes = await tx.executeSql(
+          `INSERT INTO user_accounts
+            (email, mobile, password_hash, role, is_active, is_mobile_verified, is_email_verified, created_at, updated_at)
+           VALUES (?, ?, ?, 'USER', 1, 0, 1, ?, ?)`,
+          [email, mobile, hashPassword(password), nowMysql, nowMysql],
+        );
+        const userId = Number(userRes.insertId);
         const registrationId = `SQR-${year}-${String(100000 + userId).padStart(6, '0')}`;
 
-        const recRes = tx
-          .prepare(
-            `INSERT INTO user_records
-              (user_id, registration_id, full_name, dob, gender, address, city, district, state, country, postal_code,
-               profile_photo_url, id_proof_type, id_proof_url, dynamic_fields_json, consent_accepted, consent_timestamp,
-               approval_status, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 'PENDING', ?, ?)`,
-          )
-          .run(
+        const recRes = await tx.executeSql(
+          `INSERT INTO user_records
+            (user_id, registration_id, full_name, dob, gender, address, city, district, state, country, postal_code,
+             profile_photo_url, id_proof_type, id_proof_url, dynamic_fields_json, consent_accepted, consent_timestamp,
+             approval_status, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 'PENDING', ?, ?)`,
+          [
             userId,
             registrationId,
             fullName,
@@ -722,22 +786,24 @@ export function createApiRouter(): express.Router {
             idProofType,
             idProofUrl,
             JSON.stringify(dynamicFields),
-            now,
-            now,
-            now,
-          );
-        const userRecordId = Number(recRes.lastInsertRowid);
+            nowMysql,
+            nowMysql,
+            nowMysql,
+          ],
+        );
+        const userRecordId = Number(recRes.insertId);
 
-        tx.prepare(
+        await tx.executeSql(
           `INSERT INTO registration_requests
             (user_record_id, request_type, status, notes, submitted_at)
-           VALUES (?, 'INITIAL', 'PENDING', 'Self-registration submitted with verified mobile OTP.', ?)`,
-        ).run(userRecordId, now);
+           VALUES (?, 'INITIAL', 'PENDING', 'Self-registration submitted with verified email OTP.', ?)`,
+          [userRecordId, nowMysql],
+        );
 
         return {userId, userRecordId, registrationId};
       });
 
-      createNotification({
+      await createNotification({
         recipientRole: 'ADMIN',
         type: 'NEW_REGISTRATION',
         title: 'New Registration Pending Review',
@@ -746,7 +812,7 @@ export function createApiRouter(): express.Router {
         metadata: {userRecordId: result.userRecordId, registrationId: result.registrationId},
       });
 
-      createNotification({
+      await createNotification({
         recipientUserId: result.userId,
         type: 'REGISTRATION_RECEIVED',
         title: 'Registration Received',
@@ -755,7 +821,7 @@ export function createApiRouter(): express.Router {
         metadata: {registrationId: result.registrationId},
       });
 
-      writeAuditLog(
+      await writeAuditLog(
         {id: result.userId, email, role: 'USER'},
         'USER_REGISTERED',
         'USER_RECORD',
@@ -768,8 +834,9 @@ export function createApiRouter(): express.Router {
         success: true,
         registrationId: result.registrationId,
         status: 'PENDING',
-        submittedAt: now,
-        message: 'Registration submitted successfully. Your application is awaiting administrator approval.',
+        submittedAt: nowIso,
+        message:
+          'Registration submitted successfully. Your application is awaiting administrator approval.',
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Registration failed.';
@@ -779,7 +846,7 @@ export function createApiRouter(): express.Router {
 
   // Login helper for both User & Admin endpoints
   function handleLogin(expectedPortal: 'USER' | 'ADMIN') {
-    return (req: Request, res: Response): void => {
+    return async (req: Request, res: Response): Promise<void> => {
       const identifier = String(req.body?.email || req.body?.identifier || '').trim().toLowerCase();
       const password = String(req.body?.password || '');
 
@@ -788,23 +855,19 @@ export function createApiRouter(): express.Router {
         return;
       }
 
-      const db = getDb();
-      const account = db
-        .prepare(
-          `SELECT * FROM user_accounts
-           WHERE (lower(email) = ? OR mobile = ?) AND deleted_at IS NULL`,
-        )
-        .get(identifier, identifier) as
-        | {
-            id: number;
-            email: string;
-            mobile: string;
-            password_hash: string;
-            role: 'SUPER_ADMIN' | 'ADMIN' | 'USER';
-            is_active: number;
-            is_mobile_verified: number;
-          }
-        | undefined;
+      const account = await queryOne<{
+        id: number;
+        email: string;
+        mobile: string;
+        password_hash: string;
+        role: 'SUPER_ADMIN' | 'ADMIN' | 'USER';
+        is_active: number;
+        is_mobile_verified: number;
+      }>(
+        `SELECT * FROM user_accounts
+         WHERE (LOWER(email) = ? OR mobile = ?) AND deleted_at IS NULL`,
+        [identifier, identifier],
+      );
 
       if (!account || !verifyPassword(password, account.password_hash)) {
         res.status(401).json({error: 'Invalid credentials.'});
@@ -832,11 +895,12 @@ export function createApiRouter(): express.Router {
       let approvalStatus: string | null = null;
 
       if (isAdminRole) {
-        const profile = db
-          .prepare('SELECT * FROM admin_profiles WHERE user_id = ?')
-          .get(account.id) as
-          | {full_name: string; avatar_url: string; permissions_json: string}
-          | undefined;
+        const profile = await queryOne<{
+          full_name: string;
+          avatar_url: string;
+          permissions_json: unknown;
+        }>('SELECT * FROM admin_profiles WHERE user_id = ?', [account.id]);
+
         displayName = profile?.full_name || account.email;
         avatarUrl = profile?.avatar_url || '/assets/images/avatar_admin_portrait_1794911291825.jpg';
         permissions =
@@ -850,14 +914,18 @@ export function createApiRouter(): express.Router {
                 'can_manage_users',
               ]
             : profile
-              ? (JSON.parse(profile.permissions_json) as string[])
+              ? parseJsonSafe<string[]>(profile.permissions_json, [])
               : [];
       } else {
-        const rec = db
-          .prepare('SELECT full_name, profile_photo_url, registration_id, approval_status FROM user_records WHERE user_id = ?')
-          .get(account.id) as
-          | {full_name: string; profile_photo_url: string; registration_id: string; approval_status: string}
-          | undefined;
+        const rec = await queryOne<{
+          full_name: string;
+          profile_photo_url: string;
+          registration_id: string;
+          approval_status: string;
+        }>(
+          'SELECT full_name, profile_photo_url, registration_id, approval_status FROM user_records WHERE user_id = ?',
+          [account.id],
+        );
         if (rec) {
           displayName = rec.full_name;
           avatarUrl = rec.profile_photo_url;
@@ -872,17 +940,18 @@ export function createApiRouter(): express.Router {
       );
       const refreshToken = generateRefreshToken();
       const now = new Date();
-      db.prepare(
+      await executeSql(
         `INSERT INTO refresh_tokens (user_id, token_hash, expires_at, created_at)
          VALUES (?, ?, ?, ?)`,
-      ).run(
-        account.id,
-        sha256Hex(refreshToken),
-        new Date(now.getTime() + 7 * 86400000).toISOString(),
-        now.toISOString(),
+        [
+          account.id,
+          sha256Hex(refreshToken),
+          toMysqlDateTime(now.getTime() + 7 * 86400000),
+          toMysqlDateTime(now),
+        ],
       );
 
-      writeAuditLog(
+      await writeAuditLog(
         {id: account.id, email: account.email, role: account.role},
         isAdminRole ? 'ADMIN_LOGIN' : 'USER_LOGIN',
         'USER_ACCOUNT',
@@ -912,30 +981,32 @@ export function createApiRouter(): express.Router {
   router.post('/auth/login', rateLimit('login', 20, 15 * 60 * 1000), handleLogin('USER'));
   router.post('/auth/admin/login', rateLimit('admin_login', 20, 15 * 60 * 1000), handleLogin('ADMIN'));
 
-  router.post('/auth/refresh', (req: Request, res: Response) => {
+  router.post('/auth/refresh', async (req: Request, res: Response) => {
     const refreshToken = String(req.body?.refreshToken || '');
     if (!refreshToken) {
       res.status(400).json({error: 'Refresh token required.'});
       return;
     }
-    const db = getDb();
     const tokenHash = sha256Hex(refreshToken);
-    const row = db
-      .prepare('SELECT * FROM refresh_tokens WHERE token_hash = ? AND revoked_at IS NULL')
-      .get(tokenHash) as
-      | {id: number; user_id: number; expires_at: string}
-      | undefined;
+    const row = await queryOne<{id: number; user_id: number; expires_at: Date | string}>(
+      'SELECT * FROM refresh_tokens WHERE token_hash = ? AND revoked_at IS NULL',
+      [tokenHash],
+    );
 
     if (!row || new Date(row.expires_at).getTime() <= Date.now()) {
       res.status(401).json({error: 'Refresh token is invalid or expired.'});
       return;
     }
 
-    const account = db
-      .prepare('SELECT id, email, role, is_active, deleted_at FROM user_accounts WHERE id = ?')
-      .get(row.user_id) as
-      | {id: number; email: string; role: 'SUPER_ADMIN' | 'ADMIN' | 'USER'; is_active: number; deleted_at: string | null}
-      | undefined;
+    const account = await queryOne<{
+      id: number;
+      email: string;
+      role: 'SUPER_ADMIN' | 'ADMIN' | 'USER';
+      is_active: number;
+      deleted_at: Date | string | null;
+    }>('SELECT id, email, role, is_active, deleted_at FROM user_accounts WHERE id = ?', [
+      row.user_id,
+    ]);
 
     if (!account || !account.is_active || account.deleted_at) {
       res.status(403).json({error: 'Account inactive.'});
@@ -953,10 +1024,11 @@ export function createApiRouter(): express.Router {
         'can_manage_users',
       ];
     } else if (account.role === 'ADMIN') {
-      const profile = db
-        .prepare('SELECT permissions_json FROM admin_profiles WHERE user_id = ?')
-        .get(account.id) as {permissions_json: string} | undefined;
-      permissions = profile ? (JSON.parse(profile.permissions_json) as string[]) : [];
+      const profile = await queryOne<{permissions_json: unknown}>(
+        'SELECT permissions_json FROM admin_profiles WHERE user_id = ?',
+        [account.id],
+      );
+      permissions = profile ? parseJsonSafe<string[]>(profile.permissions_json, []) : [];
     }
 
     const accessToken = signAccessToken(
@@ -966,29 +1038,33 @@ export function createApiRouter(): express.Router {
     res.json({accessToken});
   });
 
-  router.post('/auth/logout', requireAuth, (req: AuthenticatedRequest, res: Response) => {
+  router.post('/auth/logout', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
     const refreshToken = String(req.body?.refreshToken || '');
     if (refreshToken) {
-      getDb()
-        .prepare('UPDATE refresh_tokens SET revoked_at = ? WHERE token_hash = ?')
-        .run(new Date().toISOString(), sha256Hex(refreshToken));
+      await executeSql('UPDATE refresh_tokens SET revoked_at = ? WHERE token_hash = ?', [
+        toMysqlDateTime(),
+        sha256Hex(refreshToken),
+      ]);
     }
     res.json({success: true});
   });
 
-  router.get('/auth/me', requireAuth, (req: AuthenticatedRequest, res: Response) => {
+  router.get('/auth/me', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
     const auth = req.auth!;
-    const db = getDb();
-    const account = db
-      .prepare('SELECT id, email, mobile, role, is_active, is_mobile_verified, created_at FROM user_accounts WHERE id = ?')
-      .get(auth.sub) as Record<string, unknown>;
+    const account = await queryOne<Record<string, unknown>>(
+      'SELECT id, email, mobile, role, is_active, is_mobile_verified, created_at FROM user_accounts WHERE id = ?',
+      [auth.sub],
+    );
 
     if (auth.role === 'ADMIN' || auth.role === 'SUPER_ADMIN') {
-      const profile = db
-        .prepare('SELECT full_name, department, designation, avatar_url FROM admin_profiles WHERE user_id = ?')
-        .get(auth.sub) as
-        | {full_name: string; department: string; designation: string; avatar_url: string}
-        | undefined;
+      const profile = await queryOne<{
+        full_name: string;
+        department: string;
+        designation: string;
+        avatar_url: string;
+      }>('SELECT full_name, department, designation, avatar_url FROM admin_profiles WHERE user_id = ?', [
+        auth.sub,
+      ]);
       res.json({
         ...account,
         permissions: auth.permissions,
@@ -1000,11 +1076,15 @@ export function createApiRouter(): express.Router {
       return;
     }
 
-    const rec = db
-      .prepare('SELECT full_name, profile_photo_url, registration_id, approval_status FROM user_records WHERE user_id = ?')
-      .get(auth.sub) as
-      | {full_name: string; profile_photo_url: string; registration_id: string; approval_status: string}
-      | undefined;
+    const rec = await queryOne<{
+      full_name: string;
+      profile_photo_url: string;
+      registration_id: string;
+      approval_status: string;
+    }>(
+      'SELECT full_name, profile_photo_url, registration_id, approval_status FROM user_records WHERE user_id = ?',
+      [auth.sub],
+    );
     res.json({
       ...account,
       permissions: [],
@@ -1019,83 +1099,81 @@ export function createApiRouter(): express.Router {
   // USER PORTAL APIs
   // =========================================================================
 
-  router.get('/user/dashboard', requireAuth, (req: AuthenticatedRequest, res: Response) => {
+  router.get('/user/dashboard', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
     const userId = req.auth!.sub;
-    const db = getDb();
-    const record = db
-      .prepare(
-        `SELECT ur.*, ua.email, ua.mobile, ua.is_mobile_verified, ua.is_active
-         FROM user_records ur
-         JOIN user_accounts ua ON ua.id = ur.user_id
-         WHERE ur.user_id = ? AND ur.deleted_at IS NULL`,
-      )
-      .get(userId) as Record<string, unknown> | undefined;
+    const record = await queryOne<Record<string, unknown>>(
+      `SELECT ur.*, ua.email, ua.mobile, ua.is_mobile_verified, ua.is_active
+       FROM user_records ur
+       JOIN user_accounts ua ON ua.id = ur.user_id
+       WHERE ur.user_id = ? AND ur.deleted_at IS NULL`,
+      [userId],
+    );
 
     if (!record) {
       res.status(404).json({error: 'User registration record not found.'});
       return;
     }
 
-    const activeQr = db
-      .prepare(
-        `SELECT id, token_prefix, verification_url, qr_png_data_url, status, issued_at, expires_at, scan_count, last_verified_at
-         FROM qr_codes
-         WHERE user_record_id = ? AND status = 'ACTIVE'
-         ORDER BY id DESC LIMIT 1`,
-      )
-      .get(record['id'] as number) as Record<string, unknown> | undefined;
+    const activeQr = await queryOne<Record<string, unknown>>(
+      `SELECT id, token_prefix, verification_url, qr_png_data_url, status, issued_at, expires_at, scan_count, last_verified_at
+       FROM qr_codes
+       WHERE user_record_id = ? AND status = 'ACTIVE'
+       ORDER BY id DESC LIMIT 1`,
+      [record['id']],
+    );
 
-    const unreadNotifications = (
-      db
-        .prepare('SELECT COUNT(*) as cnt FROM notifications WHERE recipient_user_id = ? AND is_read = 0')
-        .get(userId) as {cnt: number}
-    ).cnt;
+    const unreadRow = await queryOne<{cnt: number}>(
+      'SELECT COUNT(*) as cnt FROM notifications WHERE recipient_user_id = ? AND is_read = 0',
+      [userId],
+    );
+    const unreadNotifications = Number(unreadRow?.cnt || 0);
 
-    const recentNotifications = db
-      .prepare(
-        `SELECT id, type, title, message, link_path, is_read, created_at
-         FROM notifications
-         WHERE recipient_user_id = ?
-         ORDER BY id DESC LIMIT 5`,
-      )
-      .all(userId);
+    const recentNotifications = await queryRows(
+      `SELECT id, type, title, message, link_path, is_read, created_at
+       FROM notifications
+       WHERE recipient_user_id = ?
+       ORDER BY id DESC LIMIT 5`,
+      [userId],
+    );
 
-    const history = db
-      .prepare(
-        `SELECT id, request_type, status, notes, submitted_at, processed_at
-         FROM registration_requests
-         WHERE user_record_id = ?
-         ORDER BY id DESC`,
-      )
-      .all(record['id'] as number);
+    const history = await queryRows(
+      `SELECT id, request_type, status, notes, submitted_at, processed_at
+       FROM registration_requests
+       WHERE user_record_id = ?
+       ORDER BY id DESC`,
+      [record['id']],
+    );
 
     res.json({
       record: {
         ...record,
-        dynamicFields: JSON.parse(String(record['dynamic_fields_json'] || '{}')),
+        dob: toMysqlDate(record['dob']) || '',
+        dynamicFields: parseJsonSafe<Record<string, unknown>>(record['dynamic_fields_json'], {}),
       },
       activeQr: activeQr || null,
       unreadNotifications,
       recentNotifications,
       history,
-      organizationName: getSetting('organization_name', 'Secure QR Verification Authority'),
+      organizationName: await getSetting('organization_name', 'Secure QR Verification Authority'),
     });
   });
 
   router.patch('/user/profile', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
     try {
       const userId = req.auth!.sub;
-      const db = getDb();
-      const record = db
-        .prepare('SELECT * FROM user_records WHERE user_id = ?')
-        .get(userId) as Record<string, unknown> | undefined;
+      const record = await queryOne<Record<string, unknown>>(
+        'SELECT * FROM user_records WHERE user_id = ?',
+        [userId],
+      );
       if (!record) {
         res.status(404).json({error: 'Record not found.'});
         return;
       }
 
       const b = req.body || {};
-      const now = new Date().toISOString();
+      const nowDate = new Date();
+      const nowIso = nowDate.toISOString();
+      const nowMysql = toMysqlDateTime(nowDate);
       const profilePhotoUrl = b.profilePhotoData
         ? await saveBase64Upload(
             String(b.profilePhotoData),
@@ -1112,30 +1190,39 @@ export function createApiRouter(): express.Router {
           )
         : (record['id_proof_url'] as string | null);
 
-      db.prepare(
+      const dynJson = b.dynamicFields
+        ? JSON.stringify(b.dynamicFields)
+        : JSON.stringify(parseJsonSafe<Record<string, unknown>>(record['dynamic_fields_json'], {}));
+
+      const dobVal = b.dob !== undefined ? toMysqlDate(b.dob) : toMysqlDate(record['dob']);
+      const genderVal =
+        b.gender !== undefined ? (b.gender ? String(b.gender).trim() || null : null) : record['gender'];
+
+      await executeSql(
         `UPDATE user_records
          SET full_name = ?, dob = ?, gender = ?, address = ?, city = ?, district = ?, state = ?, country = ?, postal_code = ?,
              profile_photo_url = ?, id_proof_type = ?, id_proof_url = ?, dynamic_fields_json = ?, updated_at = ?
          WHERE user_id = ?`,
-      ).run(
-        String(b.fullName ?? record['full_name']).trim(),
-        b.dob !== undefined ? b.dob : record['dob'],
-        b.gender !== undefined ? b.gender : record['gender'],
-        String(b.address ?? record['address']).trim(),
-        String(b.city ?? record['city']).trim(),
-        String(b.district ?? record['district']).trim(),
-        String(b.state ?? record['state']).trim(),
-        String(b.country ?? record['country']).trim(),
-        String(b.postalCode ?? record['postal_code']).trim(),
-        profilePhotoUrl,
-        String(b.idProofType ?? record['id_proof_type']),
-        idProofUrl,
-        b.dynamicFields ? JSON.stringify(b.dynamicFields) : String(record['dynamic_fields_json']),
-        now,
-        userId,
+        [
+          String(b.fullName ?? record['full_name']).trim(),
+          dobVal,
+          genderVal,
+          String(b.address ?? record['address']).trim(),
+          String(b.city ?? record['city']).trim(),
+          String(b.district ?? record['district']).trim(),
+          String(b.state ?? record['state']).trim(),
+          String(b.country ?? record['country']).trim(),
+          String(b.postalCode ?? record['postal_code']).trim(),
+          profilePhotoUrl,
+          String(b.idProofType ?? record['id_proof_type']),
+          idProofUrl,
+          dynJson,
+          nowMysql,
+          userId,
+        ],
       );
 
-      res.json({success: true, updatedAt: now});
+      res.json({success: true, updatedAt: nowIso});
     } catch (err) {
       res.status(400).json({error: err instanceof Error ? err.message : 'Update failed'});
     }
@@ -1144,10 +1231,10 @@ export function createApiRouter(): express.Router {
   router.post('/user/resubmit', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
     try {
       const userId = req.auth!.sub;
-      const db = getDb();
-      const record = db
-        .prepare('SELECT * FROM user_records WHERE user_id = ?')
-        .get(userId) as Record<string, unknown> | undefined;
+      const record = await queryOne<Record<string, unknown>>(
+        'SELECT * FROM user_records WHERE user_id = ?',
+        [userId],
+      );
 
       if (!record) {
         res.status(404).json({error: 'Registration record not found.'});
@@ -1159,7 +1246,7 @@ export function createApiRouter(): express.Router {
       }
 
       const b = req.body || {};
-      const now = new Date().toISOString();
+      const nowMysql = toMysqlDateTime();
       const profilePhotoUrl = b.profilePhotoData
         ? await saveBase64Upload(
             String(b.profilePhotoData),
@@ -1176,43 +1263,53 @@ export function createApiRouter(): express.Router {
           )
         : (record['id_proof_url'] as string | null);
 
-      withTransaction((tx) => {
-        tx.prepare(
+      const dynJson = b.dynamicFields
+        ? JSON.stringify(b.dynamicFields)
+        : JSON.stringify(parseJsonSafe<Record<string, unknown>>(record['dynamic_fields_json'], {}));
+
+      const dobVal = b.dob !== undefined ? toMysqlDate(b.dob) : toMysqlDate(record['dob']);
+      const genderVal =
+        b.gender !== undefined ? (b.gender ? String(b.gender).trim() || null : null) : record['gender'];
+
+      await withTransaction(async (tx) => {
+        await tx.executeSql(
           `UPDATE user_records
            SET full_name = ?, dob = ?, gender = ?, address = ?, city = ?, district = ?, state = ?, country = ?, postal_code = ?,
                profile_photo_url = ?, id_proof_type = ?, id_proof_url = ?, dynamic_fields_json = ?,
                approval_status = 'PENDING', resubmission_note = NULL, updated_at = ?
            WHERE id = ?`,
-        ).run(
-          String(b.fullName ?? record['full_name']).trim(),
-          b.dob ?? record['dob'],
-          b.gender ?? record['gender'],
-          String(b.address ?? record['address']).trim(),
-          String(b.city ?? record['city']).trim(),
-          String(b.district ?? record['district']).trim(),
-          String(b.state ?? record['state']).trim(),
-          String(b.country ?? record['country']).trim(),
-          String(b.postalCode ?? record['postal_code']).trim(),
-          profilePhotoUrl,
-          String(b.idProofType ?? record['id_proof_type']),
-          idProofUrl,
-          b.dynamicFields ? JSON.stringify(b.dynamicFields) : String(record['dynamic_fields_json']),
-          now,
-          record['id'] as number,
+          [
+            String(b.fullName ?? record['full_name']).trim(),
+            dobVal,
+            genderVal,
+            String(b.address ?? record['address']).trim(),
+            String(b.city ?? record['city']).trim(),
+            String(b.district ?? record['district']).trim(),
+            String(b.state ?? record['state']).trim(),
+            String(b.country ?? record['country']).trim(),
+            String(b.postalCode ?? record['postal_code']).trim(),
+            profilePhotoUrl,
+            String(b.idProofType ?? record['id_proof_type']),
+            idProofUrl,
+            dynJson,
+            nowMysql,
+            record['id'],
+          ],
         );
 
-        tx.prepare(
+        await tx.executeSql(
           `INSERT INTO registration_requests
             (user_record_id, request_type, status, notes, submitted_at)
            VALUES (?, 'RESUBMISSION', 'PENDING', ?, ?)`,
-        ).run(
-          record['id'] as number,
-          String(b.resubmissionComment || 'Applicant updated requested details and resubmitted.'),
-          now,
+          [
+            record['id'],
+            String(b.resubmissionComment || 'Applicant updated requested details and resubmitted.'),
+            nowMysql,
+          ],
         );
       });
 
-      createNotification({
+      await createNotification({
         recipientRole: 'ADMIN',
         type: 'RESUBMISSION',
         title: 'Application Resubmitted',
@@ -1227,24 +1324,28 @@ export function createApiRouter(): express.Router {
     }
   });
 
-  router.get('/user/qr/download', requireAuth, (req: AuthenticatedRequest, res: Response) => {
+  router.get('/user/qr/download', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
     const userId = req.auth!.sub;
-    const db = getDb();
-    const record = db
-      .prepare('SELECT id, registration_id, approval_status FROM user_records WHERE user_id = ?')
-      .get(userId) as {id: number; registration_id: string; approval_status: string} | undefined;
+    const record = await queryOne<{
+      id: number;
+      registration_id: string;
+      approval_status: string;
+    }>('SELECT id, registration_id, approval_status FROM user_records WHERE user_id = ?', [userId]);
 
     if (!record || record.approval_status !== 'APPROVED') {
       res.status(403).json({error: 'Only approved users can download an active QR credential.'});
       return;
     }
 
-    const qr = db
-      .prepare(
-        `SELECT qr_png_data_url, status, expires_at FROM qr_codes
-         WHERE user_record_id = ? AND status = 'ACTIVE' ORDER BY id DESC LIMIT 1`,
-      )
-      .get(record.id) as {qr_png_data_url: string; status: string; expires_at: string} | undefined;
+    const qr = await queryOne<{
+      qr_png_data_url: string;
+      status: string;
+      expires_at: Date | string;
+    }>(
+      `SELECT qr_png_data_url, status, expires_at FROM qr_codes
+       WHERE user_record_id = ? AND status = 'ACTIVE' ORDER BY id DESC LIMIT 1`,
+      [record.id],
+    );
 
     if (!qr || new Date(qr.expires_at).getTime() <= Date.now()) {
       res.status(404).json({error: 'No active non-expired QR credential found.'});
@@ -1261,53 +1362,50 @@ export function createApiRouter(): express.Router {
     res.send(buffer);
   });
 
-  router.get('/user/notifications', requireAuth, (req: AuthenticatedRequest, res: Response) => {
-    const items = getDb()
-      .prepare('SELECT * FROM notifications WHERE recipient_user_id = ? ORDER BY id DESC LIMIT 100')
-      .all(req.auth!.sub);
+  router.get('/user/notifications', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+    const items = await queryRows(
+      'SELECT * FROM notifications WHERE recipient_user_id = ? ORDER BY id DESC LIMIT 100',
+      [req.auth!.sub],
+    );
     res.json({notifications: items});
   });
 
-  router.post('/user/notifications/:id/read', requireAuth, (req: AuthenticatedRequest, res: Response) => {
-    const now = new Date().toISOString();
-    getDb()
-      .prepare(
-        'UPDATE notifications SET is_read = 1, read_at = ? WHERE id = ? AND recipient_user_id = ?',
-      )
-      .run(now, Number(req.params['id']), req.auth!.sub);
+  router.post('/user/notifications/:id/read', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+    await executeSql(
+      'UPDATE notifications SET is_read = 1, read_at = ? WHERE id = ? AND recipient_user_id = ?',
+      [toMysqlDateTime(), Number(req.params['id']), req.auth!.sub],
+    );
     res.json({success: true});
   });
 
-  router.post('/user/notifications/read-all', requireAuth, (req: AuthenticatedRequest, res: Response) => {
-    const now = new Date().toISOString();
-    getDb()
-      .prepare(
-        'UPDATE notifications SET is_read = 1, read_at = ? WHERE recipient_user_id = ? AND is_read = 0',
-      )
-      .run(now, req.auth!.sub);
+  router.post('/user/notifications/read-all', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+    await executeSql(
+      'UPDATE notifications SET is_read = 1, read_at = ? WHERE recipient_user_id = ? AND is_read = 0',
+      [toMysqlDateTime(), req.auth!.sub],
+    );
     res.json({success: true});
   });
 
-  router.post('/user/change-password', requireAuth, (req: AuthenticatedRequest, res: Response) => {
+  router.post('/user/change-password', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
     const currentPassword = String(req.body?.currentPassword || '');
     const newPassword = String(req.body?.newPassword || '');
     if (newPassword.length < 8) {
       res.status(400).json({error: 'New password must be at least 8 characters long.'});
       return;
     }
-    const db = getDb();
-    const account = db
-      .prepare('SELECT password_hash FROM user_accounts WHERE id = ?')
-      .get(req.auth!.sub) as {password_hash: string} | undefined;
+    const account = await queryOne<{password_hash: string}>(
+      'SELECT password_hash FROM user_accounts WHERE id = ?',
+      [req.auth!.sub],
+    );
     if (!account || !verifyPassword(currentPassword, account.password_hash)) {
       res.status(400).json({error: 'Current password is incorrect.'});
       return;
     }
-    db.prepare('UPDATE user_accounts SET password_hash = ?, updated_at = ? WHERE id = ?').run(
+    await executeSql('UPDATE user_accounts SET password_hash = ?, updated_at = ? WHERE id = ?', [
       hashPassword(newPassword),
-      new Date().toISOString(),
+      toMysqlDateTime(),
       req.auth!.sub,
-    );
+    ]);
     res.json({success: true});
   });
 
@@ -1315,78 +1413,58 @@ export function createApiRouter(): express.Router {
   // ADMIN PORTAL APIs
   // =========================================================================
 
-  router.get('/admin/dashboard/stats', requireAuth, requireAdmin, (_req: AuthenticatedRequest, res: Response) => {
-    const db = getDb();
+  router.get('/admin/dashboard/stats', requireAuth, requireAdmin, async (_req: AuthenticatedRequest, res: Response) => {
     // Auto-expire past-due active QRs
-    db.prepare(
-      `UPDATE qr_codes SET status = 'EXPIRED' WHERE status = 'ACTIVE' AND expires_at <= ?`,
-    ).run(new Date().toISOString());
+    await executeSql(`UPDATE qr_codes SET status = 'EXPIRED' WHERE status = 'ACTIVE' AND expires_at <= ?`, [
+      toMysqlDateTime(),
+    ]);
 
-    const totalUsers = (
-      db
-        .prepare("SELECT COUNT(*) as c FROM user_accounts WHERE role = 'USER' AND deleted_at IS NULL")
-        .get() as {c: number}
-    ).c;
-    const pendingRegistrations = (
-      db
-        .prepare("SELECT COUNT(*) as c FROM user_records WHERE approval_status = 'PENDING' AND deleted_at IS NULL")
-        .get() as {c: number}
-    ).c;
-    const approvedUsers = (
-      db
-        .prepare("SELECT COUNT(*) as c FROM user_records WHERE approval_status = 'APPROVED' AND deleted_at IS NULL")
-        .get() as {c: number}
-    ).c;
-    const rejectedUsers = (
-      db
-        .prepare("SELECT COUNT(*) as c FROM user_records WHERE approval_status = 'REJECTED' AND deleted_at IS NULL")
-        .get() as {c: number}
-    ).c;
-    const resubmissionRequests = (
-      db
-        .prepare("SELECT COUNT(*) as c FROM user_records WHERE approval_status = 'RESUBMISSION_REQUIRED' AND deleted_at IS NULL")
-        .get() as {c: number}
-    ).c;
-    const activeQrCodes = (
-      db.prepare("SELECT COUNT(*) as c FROM qr_codes WHERE status = 'ACTIVE'").get() as {c: number}
-    ).c;
-    const expiredQrCodes = (
-      db.prepare("SELECT COUNT(*) as c FROM qr_codes WHERE status = 'EXPIRED'").get() as {c: number}
-    ).c;
-    const revokedQrCodes = (
-      db.prepare("SELECT COUNT(*) as c FROM qr_codes WHERE status = 'REVOKED'").get() as {c: number}
-    ).c;
-    const totalQrScans = (
-      db.prepare('SELECT COUNT(*) as c FROM qr_scan_logs').get() as {c: number}
-    ).c;
+    const countOf = async (sql: string): Promise<number> => {
+      const r = await queryOne<{c: number}>(sql);
+      return Number(r?.c || 0);
+    };
 
-    const recentRegistrations = db
-      .prepare(
-        `SELECT ur.id, ur.registration_id, ur.full_name, ur.city, ur.state, ur.approval_status, ur.created_at, ur.profile_photo_url, ua.email
-         FROM user_records ur
-         JOIN user_accounts ua ON ua.id = ur.user_id
-         WHERE ur.deleted_at IS NULL
-         ORDER BY ur.id DESC LIMIT 6`,
-      )
-      .all();
+    const [
+      totalUsers,
+      pendingRegistrations,
+      approvedUsers,
+      rejectedUsers,
+      resubmissionRequests,
+      activeQrCodes,
+      expiredQrCodes,
+      revokedQrCodes,
+      totalQrScans,
+      unreadNotifications,
+    ] = await Promise.all([
+      countOf("SELECT COUNT(*) as c FROM user_accounts WHERE role = 'USER' AND deleted_at IS NULL"),
+      countOf("SELECT COUNT(*) as c FROM user_records WHERE approval_status = 'PENDING' AND deleted_at IS NULL"),
+      countOf("SELECT COUNT(*) as c FROM user_records WHERE approval_status = 'APPROVED' AND deleted_at IS NULL"),
+      countOf("SELECT COUNT(*) as c FROM user_records WHERE approval_status = 'REJECTED' AND deleted_at IS NULL"),
+      countOf("SELECT COUNT(*) as c FROM user_records WHERE approval_status = 'RESUBMISSION_REQUIRED' AND deleted_at IS NULL"),
+      countOf("SELECT COUNT(*) as c FROM qr_codes WHERE status = 'ACTIVE'"),
+      countOf("SELECT COUNT(*) as c FROM qr_codes WHERE status = 'EXPIRED'"),
+      countOf("SELECT COUNT(*) as c FROM qr_codes WHERE status = 'REVOKED'"),
+      countOf('SELECT COUNT(*) as c FROM qr_scan_logs'),
+      countOf("SELECT COUNT(*) as c FROM notifications WHERE recipient_role IN ('ADMIN', 'SUPER_ADMIN') AND is_read = 0"),
+    ]);
 
-    const recentScans = db
-      .prepare(
-        `SELECT sl.id, sl.result_status, sl.reason, sl.scanned_token_prefix, sl.scanned_at,
-                ur.full_name as holder_name, ur.registration_id,
-                ap.full_name as scanner_name
-         FROM qr_scan_logs sl
-         LEFT JOIN user_records ur ON ur.id = sl.user_record_id
-         LEFT JOIN admin_profiles ap ON ap.user_id = sl.scanned_by_admin_id
-         ORDER BY sl.id DESC LIMIT 6`,
-      )
-      .all();
+    const recentRegistrations = await queryRows(
+      `SELECT ur.id, ur.registration_id, ur.full_name, ur.city, ur.state, ur.approval_status, ur.created_at, ur.profile_photo_url, ua.email
+       FROM user_records ur
+       JOIN user_accounts ua ON ua.id = ur.user_id
+       WHERE ur.deleted_at IS NULL
+       ORDER BY ur.id DESC LIMIT 6`,
+    );
 
-    const unreadNotifications = (
-      db
-        .prepare("SELECT COUNT(*) as c FROM notifications WHERE recipient_role IN ('ADMIN', 'SUPER_ADMIN') AND is_read = 0")
-        .get() as {c: number}
-    ).c;
+    const recentScans = await queryRows(
+      `SELECT sl.id, sl.result_status, sl.reason, sl.scanned_token_prefix, sl.scanned_at,
+              ur.full_name as holder_name, ur.registration_id,
+              ap.full_name as scanner_name
+       FROM qr_scan_logs sl
+       LEFT JOIN user_records ur ON ur.id = sl.user_record_id
+       LEFT JOIN admin_profiles ap ON ap.user_id = sl.scanned_by_admin_id
+       ORDER BY sl.id DESC LIMIT 6`,
+    );
 
     res.json({
       stats: {
@@ -1411,7 +1489,7 @@ export function createApiRouter(): express.Router {
     '/admin/registrations',
     requireAuth,
     requirePermission('can_view_registrations'),
-    (req: AuthenticatedRequest, res: Response) => {
+    async (req: AuthenticatedRequest, res: Response) => {
       const status = String(req.query['status'] || '').trim();
       const search = String(req.query['search'] || '').trim();
       const state = String(req.query['state'] || '').trim();
@@ -1431,24 +1509,24 @@ export function createApiRouter(): express.Router {
         params.push(status);
       }
       if (state) {
-        where.push('lower(ur.state) = lower(?)');
+        where.push('LOWER(ur.state) = LOWER(?)');
         params.push(state);
       }
       if (city) {
-        where.push('lower(ur.city) = lower(?)');
+        where.push('LOWER(ur.city) = LOWER(?)');
         params.push(city);
       }
       if (dateFrom) {
         where.push('ur.created_at >= ?');
-        params.push(dateFrom);
+        params.push(toMysqlDateTime(`${dateFrom}T00:00:00.000Z`));
       }
       if (dateTo) {
         where.push('ur.created_at <= ?');
-        params.push(`${dateTo}T23:59:59.999Z`);
+        params.push(toMysqlDateTime(`${dateTo}T23:59:59.999Z`));
       }
       if (search) {
         where.push(
-          '(lower(ur.full_name) LIKE ? OR lower(ur.registration_id) LIKE ? OR lower(ua.email) LIKE ? OR ua.mobile LIKE ?)',
+          '(LOWER(ur.full_name) LIKE ? OR LOWER(ur.registration_id) LIKE ? OR LOWER(ua.email) LIKE ? OR ua.mobile LIKE ?)',
         );
         const like = `%${search.toLowerCase()}%`;
         params.push(like, like, like, like);
@@ -1463,40 +1541,37 @@ export function createApiRouter(): express.Router {
       };
       const sortCol = allowedSorts[sortBy] || 'ur.created_at';
 
-      const db = getDb();
       const whereSql = where.join(' AND ');
-      const total = (
-        db
-          .prepare(
-            `SELECT COUNT(*) as c FROM user_records ur JOIN user_accounts ua ON ua.id = ur.user_id WHERE ${whereSql}`,
-          )
-          .get(...params) as {c: number}
-      ).c;
+      const totalRow = await queryOne<{c: number}>(
+        `SELECT COUNT(*) as c FROM user_records ur JOIN user_accounts ua ON ua.id = ur.user_id WHERE ${whereSql}`,
+        params,
+      );
+      const total = Number(totalRow?.c || 0);
 
-      const rows = db
-        .prepare(
-          `SELECT ur.*, ua.email, ua.mobile, ua.is_active, ua.is_mobile_verified,
-                  (SELECT status FROM qr_codes q WHERE q.user_record_id = ur.id ORDER BY q.id DESC LIMIT 1) as latest_qr_status,
-                  (SELECT expires_at FROM qr_codes q WHERE q.user_record_id = ur.id ORDER BY q.id DESC LIMIT 1) as latest_qr_expires_at
-           FROM user_records ur
-           JOIN user_accounts ua ON ua.id = ur.user_id
-           WHERE ${whereSql}
-           ORDER BY ${sortCol} ${sortDir}
-           LIMIT ? OFFSET ?`,
-        )
-        .all(...params, pageSize, (page - 1) * pageSize) as Record<string, unknown>[];
+      const rows = await queryRows<Record<string, unknown>>(
+        `SELECT ur.*, ua.email, ua.mobile, ua.is_active, ua.is_mobile_verified,
+                (SELECT status FROM qr_codes q WHERE q.user_record_id = ur.id ORDER BY q.id DESC LIMIT 1) as latest_qr_status,
+                (SELECT expires_at FROM qr_codes q WHERE q.user_record_id = ur.id ORDER BY q.id DESC LIMIT 1) as latest_qr_expires_at
+         FROM user_records ur
+         JOIN user_accounts ua ON ua.id = ur.user_id
+         WHERE ${whereSql}
+         ORDER BY ${sortCol} ${sortDir}
+         LIMIT ? OFFSET ?`,
+        [...params, pageSize, (page - 1) * pageSize],
+      );
 
-      const states = db
-        .prepare('SELECT DISTINCT state FROM user_records WHERE deleted_at IS NULL ORDER BY state ASC')
-        .all() as {state: string}[];
-      const cities = db
-        .prepare('SELECT DISTINCT city FROM user_records WHERE deleted_at IS NULL ORDER BY city ASC')
-        .all() as {city: string}[];
+      const states = await queryRows<{state: string}>(
+        'SELECT DISTINCT state FROM user_records WHERE deleted_at IS NULL ORDER BY state ASC',
+      );
+      const cities = await queryRows<{city: string}>(
+        'SELECT DISTINCT city FROM user_records WHERE deleted_at IS NULL ORDER BY city ASC',
+      );
 
       res.json({
         items: rows.map((r) => ({
           ...r,
-          dynamicFields: JSON.parse(String(r['dynamic_fields_json'] || '{}')),
+          dob: toMysqlDate(r['dob']) || '',
+          dynamicFields: parseJsonSafe<Record<string, unknown>>(r['dynamic_fields_json'], {}),
         })),
         total,
         page,
@@ -1513,44 +1588,41 @@ export function createApiRouter(): express.Router {
     '/admin/registrations/:id',
     requireAuth,
     requirePermission('can_view_registrations'),
-    (req: AuthenticatedRequest, res: Response) => {
+    async (req: AuthenticatedRequest, res: Response) => {
       const id = Number(req.params['id']);
-      const db = getDb();
-      const row = db
-        .prepare(
-          `SELECT ur.*, ua.email, ua.mobile, ua.is_active, ua.is_mobile_verified
-           FROM user_records ur
-           JOIN user_accounts ua ON ua.id = ur.user_id
-           WHERE ur.id = ? AND ur.deleted_at IS NULL`,
-        )
-        .get(id) as Record<string, unknown> | undefined;
+      const row = await queryOne<Record<string, unknown>>(
+        `SELECT ur.*, ua.email, ua.mobile, ua.is_active, ua.is_mobile_verified
+         FROM user_records ur
+         JOIN user_accounts ua ON ua.id = ur.user_id
+         WHERE ur.id = ? AND ur.deleted_at IS NULL`,
+        [id],
+      );
 
       if (!row) {
         res.status(404).json({error: 'Registration record not found.'});
         return;
       }
 
-      const history = db
-        .prepare(
-          `SELECT rr.*, ap.full_name as admin_name
-           FROM registration_requests rr
-           LEFT JOIN admin_profiles ap ON ap.user_id = rr.processed_by
-           WHERE rr.user_record_id = ?
-           ORDER BY rr.id DESC`,
-        )
-        .all(id);
+      const history = await queryRows(
+        `SELECT rr.*, ap.full_name as admin_name
+         FROM registration_requests rr
+         LEFT JOIN admin_profiles ap ON ap.user_id = rr.processed_by
+         WHERE rr.user_record_id = ?
+         ORDER BY rr.id DESC`,
+        [id],
+      );
 
-      const qrs = db
-        .prepare(
-          `SELECT id, token_prefix, status, issued_at, expires_at, revoked_at, revoke_reason, scan_count, last_verified_at
-           FROM qr_codes WHERE user_record_id = ? ORDER BY id DESC`,
-        )
-        .all(id);
+      const qrs = await queryRows(
+        `SELECT id, token_prefix, status, issued_at, expires_at, revoked_at, revoke_reason, scan_count, last_verified_at
+         FROM qr_codes WHERE user_record_id = ? ORDER BY id DESC`,
+        [id],
+      );
 
       res.json({
         record: {
           ...row,
-          dynamicFields: JSON.parse(String(row['dynamic_fields_json'] || '{}')),
+          dob: toMysqlDate(row['dob']) || '',
+          dynamicFields: parseJsonSafe<Record<string, unknown>>(row['dynamic_fields_json'], {}),
         },
         history,
         qrs,
@@ -1567,52 +1639,58 @@ export function createApiRouter(): express.Router {
       const id = Number(req.params['id']);
       const adminId = req.auth!.sub;
       const adminEmail = req.auth!.email;
-      const db = getDb();
 
-      const record = db
-        .prepare(
-          `SELECT ur.*, ua.email FROM user_records ur
-           JOIN user_accounts ua ON ua.id = ur.user_id
-           WHERE ur.id = ? AND ur.deleted_at IS NULL`,
-        )
-        .get(id) as
-        | {id: number; user_id: number; registration_id: string; full_name: string; email: string; approval_status: string}
-        | undefined;
+      const record = await queryOne<{
+        id: number;
+        user_id: number;
+        registration_id: string;
+        full_name: string;
+        email: string;
+        approval_status: string;
+      }>(
+        `SELECT ur.*, ua.email FROM user_records ur
+         JOIN user_accounts ua ON ua.id = ur.user_id
+         WHERE ur.id = ? AND ur.deleted_at IS NULL`,
+        [id],
+      );
 
       if (!record) {
         res.status(404).json({error: 'Registration not found.'});
         return;
       }
 
-      const existingActiveQr = db
-        .prepare("SELECT id FROM qr_codes WHERE user_record_id = ? AND status = 'ACTIVE'")
-        .get(record.id);
+      const existingActiveQr = await queryOne(
+        "SELECT id FROM qr_codes WHERE user_record_id = ? AND status = 'ACTIVE'",
+        [record.id],
+      );
 
       if (record.approval_status === 'APPROVED' && existingActiveQr) {
         res.status(409).json({error: 'Application is already approved with an active QR code.'});
         return;
       }
 
-      const now = new Date().toISOString();
-      withTransaction((tx) => {
-        tx.prepare(
+      const nowMysql = toMysqlDateTime();
+      await withTransaction(async (tx) => {
+        await tx.executeSql(
           `UPDATE user_records
            SET approval_status = 'APPROVED', rejection_reason = NULL, resubmission_note = NULL,
                reviewed_by = ?, reviewed_at = ?, updated_at = ?
            WHERE id = ?`,
-        ).run(adminId, now, now, record.id);
+          [adminId, nowMysql, nowMysql, record.id],
+        );
 
-        tx.prepare(
+        await tx.executeSql(
           `INSERT INTO registration_requests
             (user_record_id, request_type, status, notes, submitted_at, processed_by, processed_at)
            VALUES (?, 'INITIAL', 'APPROVED', ?, ?, ?, ?)`,
-        ).run(record.id, String(req.body?.note || 'Approved by administrator.'), now, adminId, now);
+          [record.id, String(req.body?.note || 'Approved by administrator.'), nowMysql, adminId, nowMysql],
+        );
       });
 
       try {
         const qr = await generateAndSaveQr(record.id, adminId, getBaseUrl(req));
 
-        createNotification({
+        await createNotification({
           recipientUserId: record.user_id,
           type: 'REGISTRATION_APPROVED',
           title: 'Application Approved',
@@ -1621,7 +1699,7 @@ export function createApiRouter(): express.Router {
           metadata: {registrationId: record.registration_id},
         });
 
-        createNotification({
+        await createNotification({
           recipientUserId: record.user_id,
           type: 'QR_GENERATED',
           title: 'Active QR Credential Ready',
@@ -1630,7 +1708,7 @@ export function createApiRouter(): express.Router {
           metadata: {registrationId: record.registration_id, tokenPrefix: qr.tokenPrefix},
         });
 
-        writeAuditLog(
+        await writeAuditLog(
           {id: adminId, email: adminEmail, role: req.auth!.role},
           'REGISTRATION_APPROVED_AND_QR_ISSUED',
           'USER_RECORD',
@@ -1651,9 +1729,9 @@ export function createApiRouter(): express.Router {
           },
         });
       } catch (err) {
-        // Recoverable state: approved, QR retry allowed without duplicates
         res.status(500).json({
-          error: 'Application marked APPROVED, but QR generation encountered an error. You may safely retry QR issuance.',
+          error:
+            'Application marked APPROVED, but QR generation encountered an error. You may safely retry QR issuance.',
           recoverable: true,
           details: err instanceof Error ? err.message : 'Unknown error',
         });
@@ -1665,7 +1743,7 @@ export function createApiRouter(): express.Router {
     '/admin/registrations/:id/reject',
     requireAuth,
     requirePermission('can_approve_registrations'),
-    (req: AuthenticatedRequest, res: Response) => {
+    async (req: AuthenticatedRequest, res: Response) => {
       const id = Number(req.params['id']);
       const reason = String(req.body?.reason || '').trim();
       if (!reason) {
@@ -1673,38 +1751,45 @@ export function createApiRouter(): express.Router {
         return;
       }
 
-      const db = getDb();
-      const record = db
-        .prepare('SELECT id, user_id, registration_id, full_name FROM user_records WHERE id = ? AND deleted_at IS NULL')
-        .get(id) as {id: number; user_id: number; registration_id: string; full_name: string} | undefined;
+      const record = await queryOne<{
+        id: number;
+        user_id: number;
+        registration_id: string;
+        full_name: string;
+      }>('SELECT id, user_id, registration_id, full_name FROM user_records WHERE id = ? AND deleted_at IS NULL', [
+        id,
+      ]);
 
       if (!record) {
         res.status(404).json({error: 'Registration not found.'});
         return;
       }
 
-      const now = new Date().toISOString();
-      withTransaction((tx) => {
-        tx.prepare(
+      const nowMysql = toMysqlDateTime();
+      await withTransaction(async (tx) => {
+        await tx.executeSql(
           `UPDATE user_records
            SET approval_status = 'REJECTED', rejection_reason = ?, reviewed_by = ?, reviewed_at = ?, updated_at = ?
            WHERE id = ?`,
-        ).run(reason, req.auth!.sub, now, now, record.id);
+          [reason, req.auth!.sub, nowMysql, nowMysql, record.id],
+        );
 
-        tx.prepare(
+        await tx.executeSql(
           `UPDATE qr_codes
            SET status = 'REVOKED', revoked_at = ?, revoked_by = ?, revoke_reason = 'Application rejected'
            WHERE user_record_id = ? AND status = 'ACTIVE'`,
-        ).run(now, req.auth!.sub, record.id);
+          [nowMysql, req.auth!.sub, record.id],
+        );
 
-        tx.prepare(
+        await tx.executeSql(
           `INSERT INTO registration_requests
             (user_record_id, request_type, status, notes, submitted_at, processed_by, processed_at)
            VALUES (?, 'INITIAL', 'REJECTED', ?, ?, ?, ?)`,
-        ).run(record.id, reason, now, req.auth!.sub, now);
+          [record.id, reason, nowMysql, req.auth!.sub, nowMysql],
+        );
       });
 
-      createNotification({
+      await createNotification({
         recipientUserId: record.user_id,
         type: 'REGISTRATION_REJECTED',
         title: 'Application Rejected',
@@ -1713,7 +1798,7 @@ export function createApiRouter(): express.Router {
         metadata: {registrationId: record.registration_id},
       });
 
-      writeAuditLog(
+      await writeAuditLog(
         {id: req.auth!.sub, email: req.auth!.email, role: req.auth!.role},
         'REGISTRATION_REJECTED',
         'USER_RECORD',
@@ -1730,7 +1815,7 @@ export function createApiRouter(): express.Router {
     '/admin/registrations/:id/request-resubmission',
     requireAuth,
     requirePermission('can_approve_registrations'),
-    (req: AuthenticatedRequest, res: Response) => {
+    async (req: AuthenticatedRequest, res: Response) => {
       const id = Number(req.params['id']);
       const note = String(req.body?.note || '').trim();
       if (!note) {
@@ -1738,32 +1823,37 @@ export function createApiRouter(): express.Router {
         return;
       }
 
-      const db = getDb();
-      const record = db
-        .prepare('SELECT id, user_id, registration_id FROM user_records WHERE id = ? AND deleted_at IS NULL')
-        .get(id) as {id: number; user_id: number; registration_id: string} | undefined;
+      const record = await queryOne<{
+        id: number;
+        user_id: number;
+        registration_id: string;
+      }>('SELECT id, user_id, registration_id FROM user_records WHERE id = ? AND deleted_at IS NULL', [
+        id,
+      ]);
 
       if (!record) {
         res.status(404).json({error: 'Registration not found.'});
         return;
       }
 
-      const now = new Date().toISOString();
-      withTransaction((tx) => {
-        tx.prepare(
+      const nowMysql = toMysqlDateTime();
+      await withTransaction(async (tx) => {
+        await tx.executeSql(
           `UPDATE user_records
            SET approval_status = 'RESUBMISSION_REQUIRED', resubmission_note = ?, reviewed_by = ?, reviewed_at = ?, updated_at = ?
            WHERE id = ?`,
-        ).run(note, req.auth!.sub, now, now, record.id);
+          [note, req.auth!.sub, nowMysql, nowMysql, record.id],
+        );
 
-        tx.prepare(
+        await tx.executeSql(
           `INSERT INTO registration_requests
             (user_record_id, request_type, status, notes, submitted_at, processed_by, processed_at)
            VALUES (?, 'INITIAL', 'RESUBMISSION_REQUIRED', ?, ?, ?, ?)`,
-        ).run(record.id, note, now, req.auth!.sub, now);
+          [record.id, note, nowMysql, req.auth!.sub, nowMysql],
+        );
       });
 
-      createNotification({
+      await createNotification({
         recipientUserId: record.user_id,
         type: 'RESUBMISSION_REQUIRED',
         title: 'Resubmission Required',
@@ -1772,7 +1862,7 @@ export function createApiRouter(): express.Router {
         metadata: {registrationId: record.registration_id},
       });
 
-      writeAuditLog(
+      await writeAuditLog(
         {id: req.auth!.sub, email: req.auth!.email, role: req.auth!.role},
         'RESUBMISSION_REQUESTED',
         'USER_RECORD',
@@ -1790,19 +1880,16 @@ export function createApiRouter(): express.Router {
     '/admin/users',
     requireAuth,
     requirePermission('can_view_registrations'),
-    (req: AuthenticatedRequest, res: Response) => {
+    async (req: AuthenticatedRequest, res: Response) => {
       const search = String(req.query['search'] || '').trim().toLowerCase();
-      const db = getDb();
-      const rows = db
-        .prepare(
-          `SELECT ua.id as account_id, ua.email, ua.mobile, ua.is_active, ua.is_mobile_verified, ua.created_at as account_created_at,
-                  ur.id as record_id, ur.registration_id, ur.full_name, ur.city, ur.state, ur.country, ur.approval_status, ur.profile_photo_url
-           FROM user_accounts ua
-           JOIN user_records ur ON ur.user_id = ua.id
-           WHERE ua.role = 'USER' AND ua.deleted_at IS NULL
-           ORDER BY ua.id DESC`,
-        )
-        .all() as Record<string, unknown>[];
+      const rows = await queryRows<Record<string, unknown>>(
+        `SELECT ua.id as account_id, ua.email, ua.mobile, ua.is_active, ua.is_mobile_verified, ua.created_at as account_created_at,
+                ur.id as record_id, ur.registration_id, ur.full_name, ur.city, ur.state, ur.country, ur.approval_status, ur.profile_photo_url
+         FROM user_accounts ua
+         JOIN user_records ur ON ur.user_id = ua.id
+         WHERE ua.role = 'USER' AND ua.deleted_at IS NULL
+         ORDER BY ua.id DESC`,
+      );
 
       const filtered = search
         ? rows.filter(
@@ -1822,26 +1909,25 @@ export function createApiRouter(): express.Router {
     '/admin/users/:accountId/status',
     requireAuth,
     requirePermission('can_manage_users'),
-    (req: AuthenticatedRequest, res: Response) => {
+    async (req: AuthenticatedRequest, res: Response) => {
       const accountId = Number(req.params['accountId']);
       const isActive = Boolean(req.body?.isActive);
-      const db = getDb();
-      const target = db
-        .prepare("SELECT id, email FROM user_accounts WHERE id = ? AND role = 'USER'")
-        .get(accountId) as {id: number; email: string} | undefined;
+      const target = await queryOne<{id: number; email: string}>(
+        "SELECT id, email FROM user_accounts WHERE id = ? AND role = 'USER'",
+        [accountId],
+      );
       if (!target) {
         res.status(404).json({error: 'User account not found.'});
         return;
       }
 
-      const now = new Date().toISOString();
-      db.prepare('UPDATE user_accounts SET is_active = ?, updated_at = ? WHERE id = ?').run(
+      await executeSql('UPDATE user_accounts SET is_active = ?, updated_at = ? WHERE id = ?', [
         isActive ? 1 : 0,
-        now,
+        toMysqlDateTime(),
         accountId,
-      );
+      ]);
 
-      writeAuditLog(
+      await writeAuditLog(
         {id: req.auth!.sub, email: req.auth!.email, role: req.auth!.role},
         isActive ? 'USER_ACTIVATED' : 'USER_DEACTIVATED',
         'USER_ACCOUNT',
@@ -1859,24 +1945,21 @@ export function createApiRouter(): express.Router {
     '/admin/qrs',
     requireAuth,
     requirePermission('can_manage_qr'),
-    (_req: AuthenticatedRequest, res: Response) => {
-      const db = getDb();
-      db.prepare(
-        `UPDATE qr_codes SET status = 'EXPIRED' WHERE status = 'ACTIVE' AND expires_at <= ?`,
-      ).run(new Date().toISOString());
+    async (_req: AuthenticatedRequest, res: Response) => {
+      await executeSql(`UPDATE qr_codes SET status = 'EXPIRED' WHERE status = 'ACTIVE' AND expires_at <= ?`, [
+        toMysqlDateTime(),
+      ]);
 
-      const qrs = db
-        .prepare(
-          `SELECT q.id, q.user_record_id, q.token_prefix, q.verification_url, q.qr_png_data_url, q.status,
-                  q.issued_at, q.expires_at, q.revoked_at, q.revoke_reason, q.last_verified_at, q.scan_count,
-                  ur.registration_id, ur.full_name, ur.city, ur.state, ur.approval_status, ur.profile_photo_url,
-                  ua.email, ua.is_active
-           FROM qr_codes q
-           JOIN user_records ur ON ur.id = q.user_record_id
-           JOIN user_accounts ua ON ua.id = ur.user_id
-           ORDER BY q.id DESC`,
-        )
-        .all();
+      const qrs = await queryRows(
+        `SELECT q.id, q.user_record_id, q.token_prefix, q.verification_url, q.qr_png_data_url, q.status,
+                q.issued_at, q.expires_at, q.revoked_at, q.revoke_reason, q.last_verified_at, q.scan_count,
+                ur.registration_id, ur.full_name, ur.city, ur.state, ur.approval_status, ur.profile_photo_url,
+                ua.email, ua.is_active
+         FROM qr_codes q
+         JOIN user_records ur ON ur.id = q.user_record_id
+         JOIN user_accounts ua ON ua.id = ur.user_id
+         ORDER BY q.id DESC`,
+      );
 
       res.json({qrs});
     },
@@ -1888,11 +1971,14 @@ export function createApiRouter(): express.Router {
     requirePermission('can_manage_qr'),
     async (req: AuthenticatedRequest, res: Response) => {
       const userRecordId = Number(req.params['userRecordId']);
-      const record = getDb()
-        .prepare('SELECT id, user_id, registration_id, approval_status FROM user_records WHERE id = ? AND deleted_at IS NULL')
-        .get(userRecordId) as
-        | {id: number; user_id: number; registration_id: string; approval_status: string}
-        | undefined;
+      const record = await queryOne<{
+        id: number;
+        user_id: number;
+        registration_id: string;
+        approval_status: string;
+      }>('SELECT id, user_id, registration_id, approval_status FROM user_records WHERE id = ? AND deleted_at IS NULL', [
+        userRecordId,
+      ]);
 
       if (!record) {
         res.status(404).json({error: 'User record not found.'});
@@ -1904,14 +1990,14 @@ export function createApiRouter(): express.Router {
       }
 
       const qr = await generateAndSaveQr(record.id, req.auth!.sub, getBaseUrl(req));
-      createNotification({
+      await createNotification({
         recipientUserId: record.user_id,
         type: 'QR_GENERATED',
         title: 'New QR Credential Issued',
         message: `A new active QR credential (${qr.tokenPrefix}...) has been issued for ${record.registration_id}.`,
         linkPath: '/user/qr-card',
       });
-      writeAuditLog(
+      await writeAuditLog(
         {id: req.auth!.sub, email: req.auth!.email, role: req.auth!.role},
         'QR_GENERATED',
         'QR_CODE',
@@ -1928,32 +2014,34 @@ export function createApiRouter(): express.Router {
     '/admin/qrs/:id/revoke',
     requireAuth,
     requirePermission('can_manage_qr'),
-    (req: AuthenticatedRequest, res: Response) => {
+    async (req: AuthenticatedRequest, res: Response) => {
       const qrId = Number(req.params['id']);
       const reason = String(req.body?.reason || 'Revoked by administrator').trim();
-      const db = getDb();
-      const qr = db
-        .prepare(
-          `SELECT q.*, ur.user_id, ur.registration_id
-           FROM qr_codes q
-           JOIN user_records ur ON ur.id = q.user_record_id
-           WHERE q.id = ?`,
-        )
-        .get(qrId) as
-        | {id: number; user_id: number; registration_id: string; token_prefix: string; status: string}
-        | undefined;
+      const qr = await queryOne<{
+        id: number;
+        user_id: number;
+        registration_id: string;
+        token_prefix: string;
+        status: string;
+      }>(
+        `SELECT q.*, ur.user_id, ur.registration_id
+         FROM qr_codes q
+         JOIN user_records ur ON ur.id = q.user_record_id
+         WHERE q.id = ?`,
+        [qrId],
+      );
 
       if (!qr) {
         res.status(404).json({error: 'QR code not found.'});
         return;
       }
 
-      const now = new Date().toISOString();
-      db.prepare(
+      await executeSql(
         `UPDATE qr_codes SET status = 'REVOKED', revoked_at = ?, revoked_by = ?, revoke_reason = ? WHERE id = ?`,
-      ).run(now, req.auth!.sub, reason, qrId);
+        [toMysqlDateTime(), req.auth!.sub, reason, qrId],
+      );
 
-      createNotification({
+      await createNotification({
         recipientUserId: qr.user_id,
         type: 'QR_REVOKED',
         title: 'QR Credential Revoked',
@@ -1961,7 +2049,7 @@ export function createApiRouter(): express.Router {
         linkPath: '/user/qr-card',
       });
 
-      writeAuditLog(
+      await writeAuditLog(
         {id: req.auth!.sub, email: req.auth!.email, role: req.auth!.role},
         'QR_REVOKED',
         'QR_CODE',
@@ -1980,17 +2068,18 @@ export function createApiRouter(): express.Router {
     requirePermission('can_manage_qr'),
     async (req: AuthenticatedRequest, res: Response) => {
       const qrId = Number(req.params['id']);
-      const db = getDb();
-      const existing = db
-        .prepare(
-          `SELECT q.user_record_id, ur.user_id, ur.registration_id, ur.approval_status
-           FROM qr_codes q
-           JOIN user_records ur ON ur.id = q.user_record_id
-           WHERE q.id = ?`,
-        )
-        .get(qrId) as
-        | {user_record_id: number; user_id: number; registration_id: string; approval_status: string}
-        | undefined;
+      const existing = await queryOne<{
+        user_record_id: number;
+        user_id: number;
+        registration_id: string;
+        approval_status: string;
+      }>(
+        `SELECT q.user_record_id, ur.user_id, ur.registration_id, ur.approval_status
+         FROM qr_codes q
+         JOIN user_records ur ON ur.id = q.user_record_id
+         WHERE q.id = ?`,
+        [qrId],
+      );
 
       if (!existing) {
         res.status(404).json({error: 'QR code not found.'});
@@ -2001,20 +2090,20 @@ export function createApiRouter(): express.Router {
         return;
       }
 
-      const now = new Date().toISOString();
-      db.prepare(
+      await executeSql(
         `UPDATE qr_codes SET status = 'REVOKED', revoked_at = ?, revoked_by = ?, revoke_reason = 'Regenerated by administrator' WHERE id = ? AND status = 'ACTIVE'`,
-      ).run(now, req.auth!.sub, qrId);
+        [toMysqlDateTime(), req.auth!.sub, qrId],
+      );
 
       const newQr = await generateAndSaveQr(existing.user_record_id, req.auth!.sub, getBaseUrl(req));
-      createNotification({
+      await createNotification({
         recipientUserId: existing.user_id,
         type: 'QR_GENERATED',
         title: 'QR Credential Regenerated',
         message: `Your previous QR was retired and a new active QR credential (${newQr.tokenPrefix}...) was issued.`,
         linkPath: '/user/qr-card',
       });
-      writeAuditLog(
+      await writeAuditLog(
         {id: req.auth!.sub, email: req.auth!.email, role: req.auth!.role},
         'QR_REGENERATED',
         'QR_CODE',
@@ -2033,7 +2122,7 @@ export function createApiRouter(): express.Router {
     requireAuth,
     requirePermission('can_scan_qr'),
     rateLimit('verify_qr', 120, 60 * 1000),
-    (req: AuthenticatedRequest, res: Response) => {
+    async (req: AuthenticatedRequest, res: Response) => {
       const rawPayload = String(req.body?.payload || '').trim();
       if (!rawPayload) {
         res.status(400).json({error: 'QR token or verification URL payload is required.'});
@@ -2043,33 +2132,33 @@ export function createApiRouter(): express.Router {
       const rawToken = extractTokenFromInput(rawPayload);
       const tokenHash = sha256Hex(rawToken);
       const tokenPrefix = tokenHash.slice(0, 12);
-      const db = getDb();
       const now = new Date();
       const nowIso = now.toISOString();
+      const nowMysql = toMysqlDateTime(now);
 
-      const qr = db
-        .prepare(
-          `SELECT q.*, ur.id as ur_id, ur.registration_id, ur.full_name, ur.profile_photo_url, ur.city, ur.state,
-                  ur.country, ur.approval_status, ur.dynamic_fields_json, ur.id_proof_type,
-                  ua.email, ua.mobile, ua.is_active, ua.deleted_at
-           FROM qr_codes q
-           JOIN user_records ur ON ur.id = q.user_record_id
-           JOIN user_accounts ua ON ua.id = ur.user_id
-           WHERE q.token_hash = ?`,
-        )
-        .get(tokenHash) as Record<string, unknown> | undefined;
+      const qr = await queryOne<Record<string, unknown>>(
+        `SELECT q.*, ur.id as ur_id, ur.registration_id, ur.full_name, ur.profile_photo_url, ur.city, ur.state,
+                ur.country, ur.approval_status, ur.dynamic_fields_json, ur.id_proof_type,
+                ua.email, ua.mobile, ua.is_active, ua.deleted_at
+         FROM qr_codes q
+         JOIN user_records ur ON ur.id = q.user_record_id
+         JOIN user_accounts ua ON ua.id = ur.user_id
+         WHERE q.token_hash = ?`,
+        [tokenHash],
+      );
 
       if (!qr) {
-        db.prepare(
+        await executeSql(
           `INSERT INTO qr_scan_logs
             (qr_code_id, user_record_id, scanned_by_admin_id, scanned_token_prefix, result_status, reason, ip_address, user_agent, scanned_at)
            VALUES (NULL, NULL, ?, ?, 'INVALID', 'No matching QR credential hash found.', ?, ?, ?)`,
-        ).run(
-          req.auth!.sub,
-          tokenPrefix,
-          req.ip || null,
-          String(req.headers['user-agent'] || ''),
-          nowIso,
+          [
+            req.auth!.sub,
+            tokenPrefix,
+            req.ip || null,
+            String(req.headers['user-agent'] || ''),
+            nowMysql,
+          ],
         );
 
         res.json({
@@ -2082,17 +2171,12 @@ export function createApiRouter(): express.Router {
       }
 
       // Duplicate scan prevention (10s window per admin + QR)
-      const recentScan = db
-        .prepare(
-          `SELECT id, scanned_at FROM qr_scan_logs
-           WHERE qr_code_id = ? AND scanned_by_admin_id = ? AND scanned_at >= ?
-           ORDER BY id DESC LIMIT 1`,
-        )
-        .get(
-          qr['id'] as number,
-          req.auth!.sub,
-          new Date(now.getTime() - 10_000).toISOString(),
-        ) as {id: number; scanned_at: string} | undefined;
+      const recentScan = await queryOne<{id: number; scanned_at: Date | string}>(
+        `SELECT id, scanned_at FROM qr_scan_logs
+         WHERE qr_code_id = ? AND scanned_by_admin_id = ? AND scanned_at >= ?
+         ORDER BY id DESC LIMIT 1`,
+        [qr['id'], req.auth!.sub, toMysqlDateTime(now.getTime() - 10_000)],
+      );
 
       let resultStatus: 'VALID' | 'EXPIRED' | 'REVOKED' | 'INACTIVE_USER' | 'UNAPPROVED_USER' = 'VALID';
       let label = 'VALID QR';
@@ -2104,13 +2188,13 @@ export function createApiRouter(): express.Router {
         reason = String(qr['revoke_reason'] || 'Credential was revoked by an administrator.');
       } else if (
         qr['status'] === 'EXPIRED' ||
-        new Date(String(qr['expires_at'])).getTime() <= now.getTime()
+        new Date(qr['expires_at'] as Date | string).getTime() <= now.getTime()
       ) {
         resultStatus = 'EXPIRED';
         label = 'EXPIRED QR';
-        reason = `Credential expired on ${String(qr['expires_at'])}.`;
+        reason = `Credential expired on ${new Date(qr['expires_at'] as Date | string).toISOString()}.`;
         if (qr['status'] === 'ACTIVE') {
-          db.prepare("UPDATE qr_codes SET status = 'EXPIRED' WHERE id = ?").run(qr['id'] as number);
+          await executeSql("UPDATE qr_codes SET status = 'EXPIRED' WHERE id = ?", [qr['id']]);
         }
       } else if (!qr['is_active'] || qr['deleted_at']) {
         resultStatus = 'INACTIVE_USER';
@@ -2123,26 +2207,28 @@ export function createApiRouter(): express.Router {
       }
 
       if (!recentScan) {
-        db.prepare(
+        await executeSql(
           `INSERT INTO qr_scan_logs
             (qr_code_id, user_record_id, scanned_by_admin_id, scanned_token_prefix, result_status, reason, ip_address, user_agent, scanned_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        ).run(
-          qr['id'] as number,
-          qr['ur_id'] as number,
-          req.auth!.sub,
-          tokenPrefix,
-          resultStatus,
-          reason,
-          req.ip || null,
-          String(req.headers['user-agent'] || ''),
-          nowIso,
+          [
+            qr['id'],
+            qr['ur_id'],
+            req.auth!.sub,
+            tokenPrefix,
+            resultStatus,
+            reason,
+            req.ip || null,
+            String(req.headers['user-agent'] || ''),
+            nowMysql,
+          ],
         );
 
         if (resultStatus === 'VALID') {
-          db.prepare(
-            'UPDATE qr_codes SET last_verified_at = ?, scan_count = scan_count + 1 WHERE id = ?',
-          ).run(nowIso, qr['id'] as number);
+          await executeSql('UPDATE qr_codes SET last_verified_at = ?, scan_count = scan_count + 1 WHERE id = ?', [
+            nowMysql,
+            qr['id'],
+          ]);
         }
       }
 
@@ -2173,7 +2259,7 @@ export function createApiRouter(): express.Router {
           profilePhotoUrl: qr['profile_photo_url'],
           idProofType: qr['id_proof_type'],
           approvalStatus: qr['approval_status'],
-          dynamicFields: JSON.parse(String(qr['dynamic_fields_json'] || '{}')),
+          dynamicFields: parseJsonSafe<Record<string, unknown>>(qr['dynamic_fields_json'], {}),
         },
       });
     },
@@ -2183,45 +2269,41 @@ export function createApiRouter(): express.Router {
     '/admin/scan-logs',
     requireAuth,
     requirePermission('can_scan_qr'),
-    (_req: AuthenticatedRequest, res: Response) => {
-      const logs = getDb()
-        .prepare(
-          `SELECT sl.*, ur.full_name as holder_name, ur.registration_id, ap.full_name as scanner_name
-           FROM qr_scan_logs sl
-           LEFT JOIN user_records ur ON ur.id = sl.user_record_id
-           LEFT JOIN admin_profiles ap ON ap.user_id = sl.scanned_by_admin_id
-           ORDER BY sl.id DESC LIMIT 100`,
-        )
-        .all();
+    async (_req: AuthenticatedRequest, res: Response) => {
+      const logs = await queryRows(
+        `SELECT sl.*, ur.full_name as holder_name, ur.registration_id, ap.full_name as scanner_name
+         FROM qr_scan_logs sl
+         LEFT JOIN user_records ur ON ur.id = sl.user_record_id
+         LEFT JOIN admin_profiles ap ON ap.user_id = sl.scanned_by_admin_id
+         ORDER BY sl.id DESC LIMIT 100`,
+      );
       res.json({logs});
     },
   );
 
   // Admin Notifications
-  router.get('/admin/notifications', requireAuth, requireAdmin, (_req: AuthenticatedRequest, res: Response) => {
-    const items = getDb()
-      .prepare(
-        `SELECT * FROM notifications
-         WHERE recipient_role IN ('ADMIN', 'SUPER_ADMIN')
-         ORDER BY id DESC LIMIT 100`,
-      )
-      .all();
+  router.get('/admin/notifications', requireAuth, requireAdmin, async (_req: AuthenticatedRequest, res: Response) => {
+    const items = await queryRows(
+      `SELECT * FROM notifications
+       WHERE recipient_role IN ('ADMIN', 'SUPER_ADMIN')
+       ORDER BY id DESC LIMIT 100`,
+    );
     res.json({notifications: items});
   });
 
-  router.post('/admin/notifications/:id/read', requireAuth, requireAdmin, (req: AuthenticatedRequest, res: Response) => {
-    getDb()
-      .prepare('UPDATE notifications SET is_read = 1, read_at = ? WHERE id = ?')
-      .run(new Date().toISOString(), Number(req.params['id']));
+  router.post('/admin/notifications/:id/read', requireAuth, requireAdmin, async (req: AuthenticatedRequest, res: Response) => {
+    await executeSql('UPDATE notifications SET is_read = 1, read_at = ? WHERE id = ?', [
+      toMysqlDateTime(),
+      Number(req.params['id']),
+    ]);
     res.json({success: true});
   });
 
-  router.post('/admin/notifications/read-all', requireAuth, requireAdmin, (_req: AuthenticatedRequest, res: Response) => {
-    getDb()
-      .prepare(
-        "UPDATE notifications SET is_read = 1, read_at = ? WHERE recipient_role IN ('ADMIN', 'SUPER_ADMIN') AND is_read = 0",
-      )
-      .run(new Date().toISOString());
+  router.post('/admin/notifications/read-all', requireAuth, requireAdmin, async (_req: AuthenticatedRequest, res: Response) => {
+    await executeSql(
+      "UPDATE notifications SET is_read = 1, read_at = ? WHERE recipient_role IN ('ADMIN', 'SUPER_ADMIN') AND is_read = 0",
+      [toMysqlDateTime()],
+    );
     res.json({success: true});
   });
 
@@ -2245,21 +2327,20 @@ export function createApiRouter(): express.Router {
         dateTo,
       });
 
-      getDb()
-        .prepare(
-          `INSERT INTO export_history (admin_user_id, admin_email, filters_json, record_count, filename, exported_at)
-           VALUES (?, ?, ?, ?, ?, ?)`,
-        )
-        .run(
+      await executeSql(
+        `INSERT INTO export_history (admin_user_id, admin_email, filters_json, record_count, filename, exported_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [
           req.auth!.sub,
           req.auth!.email,
           JSON.stringify({status, state, city, dateFrom, dateTo}),
           recordCount,
           filename,
-          new Date().toISOString(),
-        );
+          toMysqlDateTime(),
+        ],
+      );
 
-      writeAuditLog(
+      await writeAuditLog(
         {id: req.auth!.sub, email: req.auth!.email, role: req.auth!.role},
         'EXCEL_EXPORTED',
         'EXPORT',
@@ -2281,10 +2362,8 @@ export function createApiRouter(): express.Router {
     '/admin/export/history',
     requireAuth,
     requirePermission('can_export_excel'),
-    (_req: AuthenticatedRequest, res: Response) => {
-      const history = getDb()
-        .prepare('SELECT * FROM export_history ORDER BY id DESC LIMIT 50')
-        .all();
+    async (_req: AuthenticatedRequest, res: Response) => {
+      const history = await queryRows('SELECT * FROM export_history ORDER BY id DESC LIMIT 50');
       res.json({history});
     },
   );
@@ -2295,7 +2374,7 @@ export function createApiRouter(): express.Router {
     requirePermission('can_export_excel'),
     async (req: AuthenticatedRequest, res: Response) => {
       const result = await sendDailyVerificationExcelReport('MANUAL');
-      writeAuditLog(
+      await writeAuditLog(
         {id: req.auth!.sub, email: req.auth!.email, role: req.auth!.role},
         'DAILY_EXCEL_EMAIL_TRIGGERED',
         'REPORT',
@@ -2316,10 +2395,8 @@ export function createApiRouter(): express.Router {
     '/admin/export/scheduled-logs',
     requireAuth,
     requirePermission('can_export_excel'),
-    (_req: AuthenticatedRequest, res: Response) => {
-      const logs = getDb()
-        .prepare('SELECT * FROM scheduled_report_logs ORDER BY id DESC LIMIT 30')
-        .all();
+    async (_req: AuthenticatedRequest, res: Response) => {
+      const logs = await queryRows('SELECT * FROM scheduled_report_logs ORDER BY id DESC LIMIT 30');
       res.json({
         recipientEmail:
           process.env['DAILY_REPORT_RECIPIENT_EMAIL'] ||
@@ -2335,31 +2412,28 @@ export function createApiRouter(): express.Router {
   );
 
   // Admin Management (Super Admin only)
-  router.get('/admin/admins', requireAuth, requireSuperAdmin, (_req: AuthenticatedRequest, res: Response) => {
-    const db = getDb();
-    const admins = db
-      .prepare(
-        `SELECT ua.id, ua.email, ua.mobile, ua.role, ua.is_active, ua.created_at,
-                ap.full_name, ap.department, ap.designation, ap.permissions_json, ap.avatar_url
-         FROM user_accounts ua
-         JOIN admin_profiles ap ON ap.user_id = ua.id
-         WHERE ua.role IN ('ADMIN', 'SUPER_ADMIN') AND ua.deleted_at IS NULL
-         ORDER BY ua.id ASC`,
-      )
-      .all() as Record<string, unknown>[];
+  router.get('/admin/admins', requireAuth, requireSuperAdmin, async (_req: AuthenticatedRequest, res: Response) => {
+    const admins = await queryRows<Record<string, unknown>>(
+      `SELECT ua.id, ua.email, ua.mobile, ua.role, ua.is_active, ua.created_at,
+              ap.full_name, ap.department, ap.designation, ap.permissions_json, ap.avatar_url
+       FROM user_accounts ua
+       JOIN admin_profiles ap ON ap.user_id = ua.id
+       WHERE ua.role IN ('ADMIN', 'SUPER_ADMIN') AND ua.deleted_at IS NULL
+       ORDER BY ua.id ASC`,
+    );
 
-    const availablePermissions = db.prepare('SELECT * FROM permissions ORDER BY id ASC').all();
+    const availablePermissions = await queryRows('SELECT * FROM permissions ORDER BY id ASC');
 
     res.json({
       admins: admins.map((a) => ({
         ...a,
-        permissions: JSON.parse(String(a['permissions_json'] || '[]')),
+        permissions: parseJsonSafe<string[]>(a['permissions_json'], []),
       })),
       availablePermissions,
     });
   });
 
-  router.post('/admin/admins', requireAuth, requireSuperAdmin, (req: AuthenticatedRequest, res: Response) => {
+  router.post('/admin/admins', requireAuth, requireSuperAdmin, async (req: AuthenticatedRequest, res: Response) => {
     const b = req.body || {};
     const email = String(b.email || '').trim().toLowerCase();
     const mobile = String(b.mobile || '').trim();
@@ -2374,34 +2448,34 @@ export function createApiRouter(): express.Router {
       return;
     }
 
-    const db = getDb();
-    const existing = db
-      .prepare('SELECT id FROM user_accounts WHERE lower(email) = ? OR mobile = ?')
-      .get(email, mobile);
+    const existing = await queryOne(
+      'SELECT id FROM user_accounts WHERE LOWER(email) = ? OR mobile = ?',
+      [email, mobile],
+    );
     if (existing) {
       res.status(409).json({error: 'Email or mobile already exists.'});
       return;
     }
 
-    const now = new Date().toISOString();
-    const newId = withTransaction((tx) => {
-      const u = tx
-        .prepare(
-          `INSERT INTO user_accounts
-            (email, mobile, password_hash, role, is_active, is_mobile_verified, created_at, updated_at)
-           VALUES (?, ?, ?, 'ADMIN', 1, 1, ?, ?)`,
-        )
-        .run(email, mobile, hashPassword(password), now, now);
-      const id = Number(u.lastInsertRowid);
-      tx.prepare(
+    const nowMysql = toMysqlDateTime();
+    const newId = await withTransaction(async (tx) => {
+      const u = await tx.executeSql(
+        `INSERT INTO user_accounts
+          (email, mobile, password_hash, role, is_active, is_mobile_verified, created_at, updated_at)
+         VALUES (?, ?, ?, 'ADMIN', 1, 1, ?, ?)`,
+        [email, mobile, hashPassword(password), nowMysql, nowMysql],
+      );
+      const id = Number(u.insertId);
+      await tx.executeSql(
         `INSERT INTO admin_profiles
           (user_id, full_name, department, designation, permissions_json, created_by, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      ).run(id, fullName, department, designation, JSON.stringify(permissions), req.auth!.sub, now);
+        [id, fullName, department, designation, JSON.stringify(permissions), req.auth!.sub, nowMysql],
+      );
       return id;
     });
 
-    writeAuditLog(
+    await writeAuditLog(
       {id: req.auth!.sub, email: req.auth!.email, role: req.auth!.role},
       'ADMIN_ACCOUNT_CREATED',
       'ADMIN_USER',
@@ -2413,38 +2487,38 @@ export function createApiRouter(): express.Router {
     res.status(201).json({success: true, id: newId});
   });
 
-  router.patch('/admin/admins/:id', requireAuth, requireSuperAdmin, (req: AuthenticatedRequest, res: Response) => {
+  router.patch('/admin/admins/:id', requireAuth, requireSuperAdmin, async (req: AuthenticatedRequest, res: Response) => {
     const id = Number(req.params['id']);
     if (id === req.auth!.sub && req.body?.isActive === false) {
       res.status(400).json({error: 'You cannot deactivate your own active Super Admin account.'});
       return;
     }
 
-    const db = getDb();
-    const existing = db.prepare('SELECT id, email, role FROM user_accounts WHERE id = ?').get(id) as
-      | {id: number; email: string; role: string}
-      | undefined;
+    const existing = await queryOne<{id: number; email: string; role: string}>(
+      'SELECT id, email, role FROM user_accounts WHERE id = ?',
+      [id],
+    );
     if (!existing) {
       res.status(404).json({error: 'Admin account not found.'});
       return;
     }
 
-    const now = new Date().toISOString();
+    const nowMysql = toMysqlDateTime();
     if (typeof req.body?.isActive === 'boolean') {
-      db.prepare('UPDATE user_accounts SET is_active = ?, updated_at = ? WHERE id = ?').run(
+      await executeSql('UPDATE user_accounts SET is_active = ?, updated_at = ? WHERE id = ?', [
         req.body.isActive ? 1 : 0,
-        now,
+        nowMysql,
         id,
-      );
+      ]);
     }
     if (Array.isArray(req.body?.permissions) && existing.role === 'ADMIN') {
-      db.prepare('UPDATE admin_profiles SET permissions_json = ? WHERE user_id = ?').run(
+      await executeSql('UPDATE admin_profiles SET permissions_json = ? WHERE user_id = ?', [
         JSON.stringify(req.body.permissions),
         id,
-      );
+      ]);
     }
 
-    writeAuditLog(
+    await writeAuditLog(
       {id: req.auth!.sub, email: req.auth!.email, role: req.auth!.role},
       'ADMIN_PERMISSIONS_UPDATED',
       'ADMIN_USER',
@@ -2457,18 +2531,22 @@ export function createApiRouter(): express.Router {
   });
 
   // Audit Logs (Super Admin only)
-  router.get('/admin/audit-logs', requireAuth, requireSuperAdmin, (req: AuthenticatedRequest, res: Response) => {
+  router.get('/admin/audit-logs', requireAuth, requireSuperAdmin, async (req: AuthenticatedRequest, res: Response) => {
     const action = String(req.query['action'] || '').trim();
     const search = String(req.query['search'] || '').trim().toLowerCase();
 
-    const rows = getDb()
-      .prepare('SELECT * FROM admin_activity_logs ORDER BY id DESC LIMIT 250')
-      .all() as Record<string, unknown>[];
+    const rows = await queryRows<Record<string, unknown>>(
+      'SELECT * FROM admin_activity_logs ORDER BY id DESC LIMIT 250',
+    );
 
     const filtered = rows.filter((r) => {
       if (action && r['action'] !== action) return false;
       if (search) {
-        const hay = `${r['actor_email']} ${r['action']} ${r['target_type']} ${r['details_json']}`.toLowerCase();
+        const detailsStr =
+          typeof r['details_json'] === 'string'
+            ? r['details_json']
+            : JSON.stringify(r['details_json'] || {});
+        const hay = `${r['actor_email']} ${r['action']} ${r['target_type']} ${detailsStr}`.toLowerCase();
         if (!hay.includes(search)) return false;
       }
       return true;
@@ -2478,24 +2556,24 @@ export function createApiRouter(): express.Router {
   });
 
   // System Settings & Dynamic Field Config (Super Admin only)
-  router.get('/admin/settings', requireAuth, requireSuperAdmin, (_req: AuthenticatedRequest, res: Response) => {
-    const settingsRows = getDb().prepare('SELECT key, value, updated_at FROM system_settings').all() as {
+  router.get('/admin/settings', requireAuth, requireSuperAdmin, async (_req: AuthenticatedRequest, res: Response) => {
+    const settingsRows = await queryRows<{
       key: string;
       value: string;
-      updated_at: string;
-    }[];
+      updated_at: Date | string;
+    }>('SELECT `key` AS `key`, `value` AS `value`, updated_at FROM system_settings');
     const settings: Record<string, string> = {};
     for (const s of settingsRows) settings[s.key] = s.value;
 
-    const fieldConfigs = getDb()
-      .prepare('SELECT * FROM user_field_configs ORDER BY sort_order ASC, id ASC')
-      .all() as Record<string, unknown>[];
+    const fieldConfigs = await queryRows<Record<string, unknown>>(
+      'SELECT * FROM user_field_configs ORDER BY sort_order ASC, id ASC',
+    );
 
     res.json({
       settings,
       fieldConfigs: fieldConfigs.map((f) => ({
         ...f,
-        options: JSON.parse(String(f['options_json'] || '[]')),
+        options: parseJsonSafe<string[]>(f['options_json'], []),
       })),
     });
   });
@@ -2506,10 +2584,18 @@ export function createApiRouter(): express.Router {
     requireSuperAdmin,
     async (_req: AuthenticatedRequest, res: Response) => {
       const mysqlStatus = await checkMysqlConnection();
+      const cfg = getMysqlConfig();
       res.json({
-        database: mysqlStatus,
+        database: {
+          ...mysqlStatus,
+          host: mysqlStatus.host || cfg.host,
+          database: mysqlStatus.database || cfg.database,
+        },
         integrations: {
           smtpConfigured: Boolean(
+            process.env['EMAIL_HOST_USER'] && process.env['EMAIL_HOST_PASSWORD'],
+          ),
+          emailOtpConfigured: Boolean(
             process.env['EMAIL_HOST_USER'] && process.env['EMAIL_HOST_PASSWORD'],
           ),
           smtpHost: process.env['EMAIL_HOST'] || 'smtp.gmail.com',
@@ -2518,14 +2604,6 @@ export function createApiRouter(): express.Router {
             process.env['DAILY_REPORT_RECIPIENT_EMAIL'] ||
             process.env['FIXED_ADMIN_EMAIL'] ||
             'kishore.sathayush@gmail.com',
-          smsConfigured: Boolean(
-            process.env['SMS_USER'] &&
-              process.env['SMS_PASSWORD'] &&
-              process.env['SMS_TEMPLATE_ID'],
-          ),
-          smsSender: process.env['SMS_SENDER'] || '',
-          smsTemplateId: process.env['SMS_TEMPLATE_ID'] || '',
-          reSmsTemplateId: process.env['RE_SMS_TEMPLATE_ID'] || '',
           s3Configured: Boolean(
             process.env['AWS_ACCESS_KEY_ID'] &&
               process.env['AWS_SECRET_ACCESS_KEY'] &&
@@ -2546,7 +2624,7 @@ export function createApiRouter(): express.Router {
     requireSuperAdmin,
     async (req: AuthenticatedRequest, res: Response) => {
       const result = await ensureMysqlDatabaseAndSchema();
-      writeAuditLog(
+      await writeAuditLog(
         {id: req.auth!.sub, email: req.auth!.email, role: req.auth!.role},
         'MYSQL_RDS_SCHEMA_INIT',
         'DATABASE',
@@ -2558,23 +2636,23 @@ export function createApiRouter(): express.Router {
     },
   );
 
-  router.patch('/admin/settings', requireAuth, requireSuperAdmin, (req: AuthenticatedRequest, res: Response) => {
+  router.patch('/admin/settings', requireAuth, requireSuperAdmin, async (req: AuthenticatedRequest, res: Response) => {
     const updates = req.body?.settings;
     if (!updates || typeof updates !== 'object') {
       res.status(400).json({error: 'Settings payload required.'});
       return;
     }
-    const now = new Date().toISOString();
-    const stmt = getDb().prepare(
-      `INSERT INTO system_settings (key, value, updated_at, updated_by)
-       VALUES (?, ?, ?, ?)
-       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at, updated_by = excluded.updated_by`,
-    );
+    const nowMysql = toMysqlDateTime();
     for (const [k, v] of Object.entries(updates)) {
-      stmt.run(k, String(v), now, req.auth!.sub);
+      await executeSql(
+        `INSERT INTO system_settings (\`key\`, \`value\`, updated_at, updated_by)
+         VALUES (?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE \`value\` = VALUES(\`value\`), updated_at = VALUES(updated_at), updated_by = VALUES(updated_by)`,
+        [k, String(v), nowMysql, req.auth!.sub],
+      );
     }
 
-    writeAuditLog(
+    await writeAuditLog(
       {id: req.auth!.sub, email: req.auth!.email, role: req.auth!.role},
       'SYSTEM_SETTINGS_UPDATED',
       'SETTINGS',
@@ -2586,7 +2664,7 @@ export function createApiRouter(): express.Router {
     res.json({success: true});
   });
 
-  router.post('/admin/field-configs', requireAuth, requireSuperAdmin, (req: AuthenticatedRequest, res: Response) => {
+  router.post('/admin/field-configs', requireAuth, requireSuperAdmin, async (req: AuthenticatedRequest, res: Response) => {
     const b = req.body || {};
     const fieldKey = String(b.fieldKey || '')
       .trim()
@@ -2601,13 +2679,11 @@ export function createApiRouter(): express.Router {
       return;
     }
 
-    const r = getDb()
-      .prepare(
-        `INSERT INTO user_field_configs
-          (field_key, label, field_type, is_required, is_enabled, is_editable_on_resubmit, options_json, sort_order)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
+    const r = await executeSql(
+      `INSERT INTO user_field_configs
+        (field_key, label, field_type, is_required, is_enabled, is_editable_on_resubmit, options_json, sort_order)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
         fieldKey,
         label,
         fieldType,
@@ -2616,31 +2692,31 @@ export function createApiRouter(): express.Router {
         b.isEditableOnResubmit !== false ? 1 : 0,
         JSON.stringify(Array.isArray(b.options) ? b.options : []),
         Number(b.sortOrder || 10),
-      );
+      ],
+    );
 
-    res.status(201).json({id: Number(r.lastInsertRowid)});
+    res.status(201).json({id: Number(r.insertId)});
   });
 
-  router.patch('/admin/field-configs/:id', requireAuth, requireSuperAdmin, (req: AuthenticatedRequest, res: Response) => {
+  router.patch('/admin/field-configs/:id', requireAuth, requireSuperAdmin, async (req: AuthenticatedRequest, res: Response) => {
     const id = Number(req.params['id']);
     const b = req.body || {};
-    getDb()
-      .prepare(
-        `UPDATE user_field_configs
-         SET is_required = ?, is_enabled = ?, is_editable_on_resubmit = ?
-         WHERE id = ?`,
-      )
-      .run(
+    await executeSql(
+      `UPDATE user_field_configs
+       SET is_required = ?, is_enabled = ?, is_editable_on_resubmit = ?
+       WHERE id = ?`,
+      [
         b.isRequired ? 1 : 0,
         b.isEnabled ? 1 : 0,
         b.isEditableOnResubmit ? 1 : 0,
         id,
-      );
+      ],
+    );
     res.json({success: true});
   });
 
-  router.delete('/admin/field-configs/:id', requireAuth, requireSuperAdmin, (req: AuthenticatedRequest, res: Response) => {
-    getDb().prepare('DELETE FROM user_field_configs WHERE id = ?').run(Number(req.params['id']));
+  router.delete('/admin/field-configs/:id', requireAuth, requireSuperAdmin, async (req: AuthenticatedRequest, res: Response) => {
+    await executeSql('DELETE FROM user_field_configs WHERE id = ?', [Number(req.params['id'])]);
     res.json({success: true});
   });
 
@@ -2651,19 +2727,22 @@ export function createApiRouter(): express.Router {
       info: {
         title: 'Secure QR Verification System API',
         version: '1.0.0',
-        description: 'REST API for user self-registration, OTP verification, admin approval, 256-bit QR issuance, live scanner verification, and Excel export.',
+        description:
+          'REST API for user self-registration, OTP verification, admin approval, 256-bit QR issuance, live scanner verification, and Excel export.',
       },
       paths: {
-        '/api/v1/auth/register': {post: {summary: 'Submit new user registration with verified OTP'}},
-        '/api/v1/auth/otp/send': {post: {summary: 'Dispatch 6-digit hashed OTP'}},
-        '/api/v1/auth/otp/verify': {post: {summary: 'Verify 6-digit OTP'}},
+        '/api/v1/auth/register': {post: {summary: 'Submit new user registration with verified email OTP'}},
+        '/api/v1/auth/otp/send': {post: {summary: 'Dispatch 6-digit hashed OTP via email'}},
+        '/api/v1/auth/otp/verify': {post: {summary: 'Verify 6-digit email OTP'}},
         '/api/v1/auth/login': {post: {summary: 'User portal JWT login'}},
         '/api/v1/auth/admin/login': {post: {summary: 'Admin portal JWT login'}},
         '/api/v1/user/dashboard': {get: {summary: 'Retrieve authenticated user application & active QR'}},
         '/api/v1/user/qr/download': {get: {summary: 'Download active QR credential PNG'}},
         '/api/v1/admin/dashboard/stats': {get: {summary: 'Retrieve admin KPI statistics & recent activity'}},
         '/api/v1/admin/registrations': {get: {summary: 'Filterable, paginated registration applications'}},
-        '/api/v1/admin/registrations/{id}/approve': {post: {summary: 'Approve application and trigger atomic QR issuance'}},
+        '/api/v1/admin/registrations/{id}/approve': {
+          post: {summary: 'Approve application and trigger atomic QR issuance'},
+        },
         '/api/v1/admin/registrations/{id}/reject': {post: {summary: 'Reject application with mandatory reason'}},
         '/api/v1/admin/verify-qr': {post: {summary: 'Admin-only cryptographic QR verification'}},
         '/api/v1/admin/export/excel': {get: {summary: 'Export filtered records to formatted XLSX'}},

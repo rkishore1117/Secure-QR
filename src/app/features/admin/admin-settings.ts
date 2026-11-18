@@ -131,7 +131,7 @@ import {ToastService} from '../../core/services/toast.service';
           <div class="flex flex-wrap items-center justify-between gap-2">
             <div>
               <h2 class="text-sm font-bold text-[#0F172A] font-display">Connected Services &amp; Cloud Storage</h2>
-              <p class="mt-0.5 text-xs text-slate-600">Live overview of your separate MySQL database, SMS gateway, S3 media path, and automated mailer.</p>
+              <p class="mt-0.5 text-xs text-slate-600">Live overview of your separate MySQL database, email OTP verification, S3 media path, and automated mailer.</p>
             </div>
             <span class="font-mono text-[11px] font-semibold text-slate-500">
               Primary Admin: {{ status.integrations.fixedAdminEmail }}
@@ -155,7 +155,7 @@ import {ToastService} from '../../core/services/toast.service';
                 </button>
               </div>
               <p [class.text-emerald-700]="status.database.connected" [class.text-amber-700]="!status.database.connected" class="font-semibold">
-                {{ status.database.connected ? 'Connected to ' + status.database.database : 'Local SQLite active (RDS unreachable from current network)' }}
+                {{ status.database.connected ? 'Connected to ' + status.database.database + ' (' + status.database.activeEngine + ')' : 'MySQL RDS unavailable — ' + (status.database.error || 'check host/credentials') }}
               </p>
             </div>
 
@@ -166,10 +166,10 @@ import {ToastService} from '../../core/services/toast.service';
             </div>
 
             <div class="rounded-lg border border-slate-200 bg-slate-50 p-4 text-xs space-y-1">
-              <p class="font-semibold text-[#0F172A]">SMS Verification Gateway (bulksmsgateway.in)</p>
-              <p class="font-mono text-slate-600">Sender: {{ status.integrations.smsSender || 'Not Set' }} · Template: {{ status.integrations.smsTemplateId || 'N/A' }}</p>
-              <p [class.text-emerald-700]="status.integrations.smsConfigured" [class.text-slate-600]="!status.integrations.smsConfigured" class="font-semibold">
-                {{ status.integrations.smsConfigured ? 'Active (Initial & Resend Templates Ready)' : 'Console Fallback' }}
+              <p class="font-semibold text-[#0F172A]">Email OTP Verification (Gmail SMTP)</p>
+              <p class="font-mono text-slate-600 break-all">Sender: {{ status.integrations.smtpUser || 'Not Set' }} · {{ status.integrations.smtpHost }}</p>
+              <p [class.text-emerald-700]="status.integrations.emailOtpConfigured" [class.text-slate-600]="!status.integrations.emailOtpConfigured" class="font-semibold">
+                {{ status.integrations.emailOtpConfigured ? 'Active (Registration OTP Emails Enabled)' : 'SMTP Credentials Missing' }}
               </p>
             </div>
 
@@ -196,13 +196,10 @@ export class AdminSettings implements OnInit {
     database: {configured: boolean; connected: boolean; host: string; database: string; activeEngine: string; error?: string};
     integrations: {
       smtpConfigured: boolean;
+      emailOtpConfigured: boolean;
       smtpHost: string;
       smtpUser: string;
       dailyReportRecipient: string;
-      smsConfigured: boolean;
-      smsSender: string;
-      smsTemplateId: string;
-      reSmsTemplateId: string;
       s3Configured: boolean;
       s3Bucket: string;
       s3Region: string;

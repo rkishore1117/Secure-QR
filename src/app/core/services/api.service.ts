@@ -30,20 +30,23 @@ export class ApiService {
     );
   }
 
-  sendOtp(mobile: string, purpose = 'REGISTRATION') {
+  sendOtp(email: string, purpose = 'REGISTRATION') {
     return this.http.post<{
       otpRequestId: number;
-      mobile: string;
+      email: string;
       expiresInSeconds: number;
       message: string;
+      emailDispatched?: boolean;
+      emailProvider?: string;
+      emailError?: string | null;
       devOtpHint?: string;
-    }>('/api/v1/auth/otp/send', {mobile, purpose});
+    }>('/api/v1/auth/otp/send', {email, purpose});
   }
 
-  verifyOtp(mobile: string, otp: string) {
+  verifyOtp(email: string, otp: string) {
     return this.http.post<{verified: boolean; otpVerificationId: number; verifiedAt: string}>(
       '/api/v1/auth/otp/verify',
-      {mobile, otp},
+      {email, otp},
     );
   }
 
@@ -288,13 +291,10 @@ export class ApiService {
       };
       integrations: {
         smtpConfigured: boolean;
+        emailOtpConfigured: boolean;
         smtpHost: string;
         smtpUser: string;
         dailyReportRecipient: string;
-        smsConfigured: boolean;
-        smsSender: string;
-        smsTemplateId: string;
-        reSmsTemplateId: string;
         s3Configured: boolean;
         s3Bucket: string;
         s3Region: string;

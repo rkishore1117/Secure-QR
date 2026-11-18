@@ -7,9 +7,8 @@ import {
 import express from 'express';
 import {createServer} from 'node:http';
 import {join} from 'node:path';
-import {ensureSeeded, getDb} from './server/db';
+import {ensureSeeded} from './server/db';
 import {startDailyReportScheduler} from './server/mailer';
-import {ensureMysqlDatabaseAndSchema} from './server/mysql-connector';
 import {createApiRouter} from './server/routes';
 import {notificationHub} from './server/ws';
 
@@ -24,16 +23,16 @@ const browserDistFolder = join(import.meta.dirname, '../browser');
 const app = express();
 const angularApp = new AngularNodeAppEngine();
 
-// Initialize DB, seed fixed Super Admin, bootstrap dedicated RDS database & start 24h Excel email scheduler
-getDb();
+// Initialize dedicated MySQL RDS schema, seed fixed Super Admin & start 24h Excel email scheduler
 void ensureSeeded(
   process.env['APP_URL'] && process.env['APP_URL'] !== 'MY_APP_URL'
     ? process.env['APP_URL']
     : 'http://localhost:3000',
-).then(() => {
-  startDailyReportScheduler();
-  void ensureMysqlDatabaseAndSchema();
-});
+)
+  .then(() => startDailyReportScheduler())
+  .catch((err) => {
+    console.error('[MYSQL RDS STARTUP ERROR]', err instanceof Error ? err.message : err);
+  });
 
 app.use(express.json({limit: '6mb'}));
 app.use(express.urlencoded({extended: true, limit: '6mb'}));

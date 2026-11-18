@@ -11,7 +11,7 @@ import {
   verifyAccessToken,
   verifyPassword,
 } from './crypto';
-import {ensureSeeded, getDb} from './db';
+import {ensureSeeded} from './db';
 import {createApiRouter} from './routes';
 
 async function requestJson(
@@ -45,7 +45,6 @@ describe('Secure QR Verification System — Crypto & API Integration', () => {
     } catch {
       // Optional .env file
     }
-    getDb();
     await ensureSeeded('http://localhost:3000');
 
     const app = express();
@@ -63,7 +62,7 @@ describe('Secure QR Verification System — Crypto & API Integration', () => {
     return () => {
       server.close();
     };
-  });
+  }, 30000);
 
   it('hashes and verifies passwords with scrypt timing-safe equality', () => {
     const hash = hashPassword('Str0ngPass!2026');
@@ -101,34 +100,38 @@ describe('Secure QR Verification System — Crypto & API Integration', () => {
     const mobile = `+15559${uniqueSuffix}`;
     const email = `applicant.${uniqueSuffix}@test.org`;
 
-    // 1. Duplicate check works
+    // 1. Duplicate check works against existing RDS account
+    const fixedEmail = process.env['FIXED_ADMIN_EMAIL'] || 'kishore.sathayush@gmail.com';
+    const fixedMobile = process.env['FIXED_ADMIN_MOBILE'] || '+919550000955';
     const dupRes = await requestJson(baseUrl, '/api/v1/auth/check-availability', {
       method: 'POST',
-      body: JSON.stringify({email: 'aarav.sharma@enterprise.org', mobile: '+15550101001'}),
+      body: JSON.stringify({email: fixedEmail, mobile: fixedMobile}),
     });
     expect(dupRes.status).toBe(200);
     expect(dupRes.data['emailAvailable']).toBe(false);
     expect(dupRes.data['mobileAvailable']).toBe(false);
 
-    // 2. Send OTP & Verify OTP
+    // 2. Send Email OTP & Verify Email OTP
     const sendOtpRes = await requestJson(baseUrl, '/api/v1/auth/otp/send', {
       method: 'POST',
-      body: JSON.stringify({mobile, purpose: 'REGISTRATION'}),
+      body: JSON.stringify({email, purpose: 'REGISTRATION'}),
     });
     expect(sendOtpRes.status).toBe(200);
+    expect(sendOtpRes.data['emailDispatched']).toBe(true);
+    expect(sendOtpRes.data['emailProvider']).toBe('gmail-smtp');
     const hintOtp = String(sendOtpRes.data['devOtpHint']);
     expect(hintOtp).toMatch(/^\d{6}$/);
 
     // Invalid OTP attempt increments failure
     const badVerify = await requestJson(baseUrl, '/api/v1/auth/otp/verify', {
       method: 'POST',
-      body: JSON.stringify({mobile, otp: '000000'}),
+      body: JSON.stringify({email, otp: '000000'}),
     });
     expect(badVerify.status).toBe(400);
 
     const goodVerify = await requestJson(baseUrl, '/api/v1/auth/otp/verify', {
       method: 'POST',
-      body: JSON.stringify({mobile, otp: hintOtp}),
+      body: JSON.stringify({email, otp: hintOtp}),
     });
     expect(goodVerify.status).toBe(200);
     const otpVerificationId = Number(goodVerify.data['otpVerificationId']);
@@ -262,7 +265,7 @@ describe('Secure QR Verification System — Crypto & API Integration', () => {
       'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
     );
     expect(excelRes.raw.byteLength).toBeGreaterThan(1000);
-  });
+  }, 30000);
 
   it('authenticates fixed Super Admin, inspects DB/gateway status, and logs 24h Excel email dispatch', async () => {
     const fixedEmail = process.env['FIXED_ADMIN_EMAIL'] || 'kishore.sathayush@gmail.com';
@@ -283,9 +286,11 @@ describe('Secure QR Verification System — Crypto & API Integration', () => {
     expect(dbStatus.status).toBe(200);
     const dbInfo = dbStatus.data['database'] as Record<string, unknown>;
     const integrations = dbStatus.data['integrations'] as Record<string, unknown>;
+    expect(dbInfo['connected']).toBe(true);
     expect(dbInfo['database']).toBe('secure_qr_verification');
     expect(integrations['fixedAdminEmail']).toBe('kishore.sathayush@gmail.com');
-    expect(integrations['smsSender']).toBe('STYUSH');
+    expect(integrations['emailOtpConfigured']).toBe(true);
+    expect(integrations['smtpUser']).toBe('kishore.sathayush@gmail.com');
     expect(integrations['s3Configured']).toBe(true);
     expect(integrations['filePath']).toBe('https://sathayushstorage.s3.ap-south-1.amazonaws.com/sathayush/');
 
@@ -302,7 +307,7 @@ describe('Secure QR Verification System — Crypto & API Integration', () => {
     });
     expect(sendEmailRes.status).toBe(200);
     expect(sendEmailRes.data['recipient']).toBe('kishore.sathayush@gmail.com');
-    expect(Number(sendEmailRes.data['recordCount'])).toBeGreaterThanOrEqual(5);
+    expect(Number(sendEmailRes.data['recordCount'])).toBeGreaterThanOrEqual(1);
 
     const logsRes = await requestJson(baseUrl, '/api/v1/admin/export/scheduled-logs', {
       headers: {Authorization: `Bearer ${fixedToken}`},
@@ -313,5 +318,5 @@ describe('Secure QR Verification System — Crypto & API Integration', () => {
     const logs = logsRes.data['logs'] as Record<string, unknown>[];
     expect(logs.length).toBeGreaterThanOrEqual(1);
     expect(logs[0]['trigger_type']).toBe('MANUAL');
-  }, 20000);
+  }, 30000);
 });

@@ -127,7 +127,7 @@ import {AuthService} from '../../core/services/auth.service';
                 Simple, Secure Member Verification &amp; Digital QR Passes
               </h1>
               <p class="mt-4 max-w-xl text-base leading-relaxed text-slate-600">
-                Sign up in minutes with SMS verification, track your approval in real time, carry a personalized QR ID card, and let team administrators verify members effortlessly at check-in.
+                Sign up in minutes with email OTP verification, track your approval in real time, carry a personalized QR ID card, and let team administrators verify members effortlessly at check-in.
               </p>
 
               <div class="mt-8 flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center">
@@ -179,11 +179,11 @@ import {AuthService} from '../../core/services/auth.service';
           <div class="mt-12 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
             <div class="rounded-xl border border-slate-200 bg-white p-5">
               <div class="flex items-center gap-2.5 text-[#0F172A]">
-                <mat-icon class="text-[22px]!">sms</mat-icon>
-                <h2 class="text-sm font-bold font-display">01. Quick Mobile Sign-Up</h2>
+                <mat-icon class="text-[22px]!">mark_email_read</mat-icon>
+                <h2 class="text-sm font-bold font-display">01. Quick Email Verification</h2>
               </div>
               <p class="mt-2 text-xs leading-relaxed text-slate-600">
-                Verify your phone with a one-time SMS code, add your address, and upload your photo and ID document.
+                Verify your email with a one-time code, add your contact details, and upload your photo and ID document.
               </p>
             </div>
 
