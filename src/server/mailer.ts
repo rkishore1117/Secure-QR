@@ -1,23 +1,15 @@
-import dns from 'node:dns';
-import nodemailer from 'nodemailer';
 import {executeSql, getEnvValue, queryOne, queryRows, toMysqlDateTime} from './db';
+import {
+  defaultEmailDeliveryService,
+  type EmailProviderKind,
+  type EmailTransportContext,
+  type OutgoingEmailPayload,
+} from './email-transport';
 import {buildVerifiedUsersWorkbook} from './excel';
 
-// Prefer IPv4 first on cloud runtimes (Render/containers often lack IPv6 egress)
-try {
-  dns.setDefaultResultOrder('ipv4first');
-} catch {
-  // ignore on older runtimes
-}
+export type {EmailProviderKind};
 
 let dailyIntervalHandle: ReturnType<typeof setInterval> | null = null;
-
-export type EmailProviderKind =
-  | 'https-webhook'
-  | 'brevo-https'
-  | 'resend-https'
-  | 'gmail-smtp'
-  | 'console';
 
 export const EMAIL_SETTINGS_KEYS = new Set<string>([
   'email_preferred_provider',
@@ -34,24 +26,7 @@ export const EMAIL_SETTINGS_KEYS = new Set<string>([
   'default_from_email',
 ]);
 
-export interface EffectiveEmailRuntimeConfig {
-  configured: boolean;
-  mode: EmailProviderKind;
-  configSource: 'env' | 'database' | 'mixed' | 'none';
-  smtpConfigured: boolean;
-  httpsConfigured: boolean;
-  webhookUrl: string;
-  webhookSecret: string;
-  brevoApiKey: string;
-  resendApiKey: string;
-  resendFromEmail: string;
-  smtpHost: string;
-  smtpPort: number;
-  smtpUseTls: boolean;
-  smtpUser: string;
-  smtpPassword: string;
-  defaultFromEmail: string;
-}
+export type EffectiveEmailRuntimeConfig = EmailTransportContext;
 
 export interface EmailSettingsMaskedSummary {
   activeProvider: EmailProviderKind;
@@ -83,23 +58,12 @@ export interface EmailReportResult {
 
 export interface EmailOtpResult {
   dispatched: boolean;
+  configured: boolean;
   provider: EmailProviderKind;
+  attemptedProviders?: EmailProviderKind[];
+  switchedOver?: boolean;
   recipient: string;
   error?: string;
-}
-
-interface OutgoingEmailPayload {
-  fromEmail: string;
-  senderName: string;
-  to: string;
-  subject: string;
-  text: string;
-  html: string;
-  attachments?: {
-    filename: string;
-    content: Buffer;
-    contentType: string;
-  }[];
 }
 
 export function getEmailDeliveryConfig(): {
@@ -169,55 +133,28 @@ export async function getEffectiveEmailDeliveryConfig(): Promise<EffectiveEmailR
   const smtpPassPick = pick('EMAIL_HOST_PASSWORD', 'smtp_password');
   const defaultFromPick = pick('DEFAULT_FROM_EMAIL', 'default_from_email');
 
+  const isCloudRuntime = Boolean(
+    process.env['RENDER'] ||
+      process.env['RENDER_SERVICE_ID'] ||
+      process.env['K_SERVICE'] ||
+      process.env['CLOUD_RUN_JOB'],
+  );
+
   const hasWebhook = Boolean(webhookUrlPick.val);
   const hasBrevo = Boolean(brevoPick.val);
   const hasResend = Boolean(resendPick.val);
   const hasSmtp = Boolean(smtpUserPick.val && smtpPassPick.val);
 
   const preferred = db['email_preferred_provider'] || '';
-  const isAvailable = (p: string): boolean => {
-    if (p === 'https-webhook') return hasWebhook;
-    if (p === 'brevo-https') return hasBrevo;
-    if (p === 'resend-https') return hasResend;
-    if (p === 'gmail-smtp') return hasSmtp;
-    return false;
-  };
 
-  let mode: EmailProviderKind = 'console';
-  if (preferred && isAvailable(preferred)) {
-    mode = preferred as EmailProviderKind;
-  } else if (hasWebhook) {
-    mode = 'https-webhook';
-  } else if (hasBrevo) {
-    mode = 'brevo-https';
-  } else if (hasResend) {
-    mode = 'resend-https';
-  } else if (hasSmtp) {
-    mode = 'gmail-smtp';
-  }
-
-  const activeSources = new Set<'env' | 'database'>();
-  if (mode === 'https-webhook') activeSources.add(webhookUrlPick.from === 'env' ? 'env' : 'database');
-  if (mode === 'brevo-https') activeSources.add(brevoPick.from === 'env' ? 'env' : 'database');
-  if (mode === 'resend-https') activeSources.add(resendPick.from === 'env' ? 'env' : 'database');
-  if (mode === 'gmail-smtp') {
-    if (smtpUserPick.from !== 'none') activeSources.add(smtpUserPick.from);
-    if (smtpPassPick.from !== 'none') activeSources.add(smtpPassPick.from);
-  }
-
-  let configSource: 'env' | 'database' | 'mixed' | 'none' = 'none';
-  if (activeSources.size === 1) {
-    configSource = activeSources.has('env') ? 'env' : 'database';
-  } else if (activeSources.size > 1) {
-    configSource = 'mixed';
-  }
-
-  return {
+  const draftCtx: EmailTransportContext = {
     configured: hasWebhook || hasBrevo || hasResend || hasSmtp,
-    mode,
-    configSource,
+    mode: 'console',
+    configSource: 'none',
+    preferredProvider: preferred,
     smtpConfigured: hasSmtp,
     httpsConfigured: hasWebhook || hasBrevo || hasResend,
+    isCloudRuntime,
     webhookUrl: webhookUrlPick.val,
     webhookSecret: webhookSecretPick.val,
     brevoApiKey: brevoPick.val,
@@ -230,16 +167,43 @@ export async function getEffectiveEmailDeliveryConfig(): Promise<EffectiveEmailR
     smtpPassword: smtpPassPick.val,
     defaultFromEmail: defaultFromPick.val || smtpUserPick.val || 'kishore.sathayush@gmail.com',
   };
+
+  const chain = defaultEmailDeliveryService.resolveTransportChain(draftCtx);
+  const primaryMode: EmailProviderKind = chain[0]?.kind ?? 'console';
+
+  const activeSources = new Set<'env' | 'database'>();
+  if (primaryMode === 'https-webhook') {
+    activeSources.add(webhookUrlPick.from === 'env' ? 'env' : 'database');
+  } else if (primaryMode === 'brevo-https') {
+    activeSources.add(brevoPick.from === 'env' ? 'env' : 'database');
+  } else if (primaryMode === 'resend-https') {
+    activeSources.add(resendPick.from === 'env' ? 'env' : 'database');
+  } else if (primaryMode === 'gmail-smtp') {
+    if (smtpUserPick.from !== 'none') activeSources.add(smtpUserPick.from);
+    if (smtpPassPick.from !== 'none') activeSources.add(smtpPassPick.from);
+  }
+
+  let configSource: 'env' | 'database' | 'mixed' | 'none' = 'none';
+  if (activeSources.size === 1) {
+    configSource = activeSources.has('env') ? 'env' : 'database';
+  } else if (activeSources.size > 1) {
+    configSource = 'mixed';
+  }
+
+  return {
+    ...draftCtx,
+    mode: primaryMode,
+    configSource,
+  };
 }
 
 export async function getEmailSettingsMaskedSummary(): Promise<EmailSettingsMaskedSummary> {
   const cfg = await getEffectiveEmailDeliveryConfig();
-  const db = await readDbEmailSettingsMap();
   return {
     activeProvider: cfg.mode,
     configured: cfg.configured,
     configSource: cfg.configSource,
-    preferredProvider: db['email_preferred_provider'] || cfg.mode,
+    preferredProvider: cfg.preferredProvider || cfg.mode,
     webhookUrl: cfg.webhookUrl,
     hasWebhookSecret: Boolean(cfg.webhookSecret),
     hasBrevoKey: Boolean(cfg.brevoApiKey),
@@ -254,235 +218,24 @@ export async function getEmailSettingsMaskedSummary(): Promise<EmailSettingsMask
   };
 }
 
-function createSmtpTransport(cfg: EffectiveEmailRuntimeConfig, portOverride?: number) {
-  if (!cfg.smtpUser || !cfg.smtpPassword) {
-    return null;
-  }
-  const port = portOverride ?? cfg.smtpPort;
-
-  return nodemailer.createTransport({
-    host: cfg.smtpHost,
-    port,
-    secure: port === 465,
-    requireTLS: cfg.smtpUseTls && port !== 465,
-    connectionTimeout: 8000,
-    greetingTimeout: 8000,
-    socketTimeout: 10000,
-    auth: {
-      user: cfg.smtpUser,
-      pass: cfg.smtpPassword,
-    },
-  });
-}
-
-async function sendViaAppsScriptWebhook(
-  payload: OutgoingEmailPayload,
-  cfg: EffectiveEmailRuntimeConfig,
-): Promise<void> {
-  if (!cfg.webhookUrl) throw new Error('EMAIL_WEBHOOK_URL is not configured.');
-
-  const res = await fetch(cfg.webhookUrl, {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({
-      secret: cfg.webhookSecret,
-      to: payload.to,
-      subject: payload.subject,
-      text: payload.text,
-      html: payload.html,
-      senderName: payload.senderName,
-      attachments: (payload.attachments || []).map((att) => ({
-        filename: att.filename,
-        contentType: att.contentType,
-        base64: att.content.toString('base64'),
-      })),
-    }),
-    signal: AbortSignal.timeout(15000),
-  });
-
-  const bodyText = await res.text();
-  if (!res.ok) {
-    throw new Error(`Apps Script webhook HTTP ${res.status}: ${bodyText.slice(0, 180)}`);
-  }
-  try {
-    const parsed = JSON.parse(bodyText) as {ok?: boolean; error?: string};
-    if (parsed.ok === false) {
-      throw new Error(parsed.error || 'Apps Script webhook returned ok=false');
-    }
-  } catch (err) {
-    if (err instanceof SyntaxError) {
-      if (bodyText.includes('ServiceLogin') || bodyText.includes('accounts.google.com')) {
-        throw new Error(
-          'Apps Script URL requires Web App access set to "Anyone" (redirected to Google login).',
-        );
-      }
-      return;
-    }
-    throw err;
-  }
-}
-
-async function sendViaBrevoHttps(
-  payload: OutgoingEmailPayload,
-  cfg: EffectiveEmailRuntimeConfig,
-): Promise<void> {
-  if (!cfg.brevoApiKey) throw new Error('BREVO_API_KEY is not configured.');
-
-  const body: Record<string, unknown> = {
-    sender: {name: payload.senderName, email: payload.fromEmail},
-    to: [{email: payload.to}],
-    subject: payload.subject,
-    textContent: payload.text,
-    htmlContent: payload.html,
-  };
-
-  if (payload.attachments && payload.attachments.length > 0) {
-    body['attachment'] = payload.attachments.map((att) => ({
-      name: att.filename,
-      content: att.content.toString('base64'),
-    }));
-  }
-
-  const res = await fetch('https://api.brevo.com/v3/smtp/email', {
-    method: 'POST',
-    headers: {
-      'api-key': cfg.brevoApiKey,
-      'Content-Type': 'application/json',
-      Accept: 'application/json',
-    },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(15000),
-  });
-
-  if (!res.ok) {
-    const errBody = await res.text();
-    throw new Error(`Brevo API ${res.status}: ${errBody.slice(0, 200)}`);
-  }
-}
-
-async function sendViaResendHttps(
-  payload: OutgoingEmailPayload,
-  cfg: EffectiveEmailRuntimeConfig,
-): Promise<void> {
-  if (!cfg.resendApiKey) throw new Error('RESEND_API_KEY is not configured.');
-
-  const fromHeader = cfg.resendFromEmail || `${payload.senderName} <${payload.fromEmail}>`;
-  const body: Record<string, unknown> = {
-    from: fromHeader,
-    to: [payload.to],
-    subject: payload.subject,
-    text: payload.text,
-    html: payload.html,
-  };
-
-  if (payload.attachments && payload.attachments.length > 0) {
-    body['attachments'] = payload.attachments.map((att) => ({
-      filename: att.filename,
-      content: att.content.toString('base64'),
-    }));
-  }
-
-  const res = await fetch('https://api.resend.com/emails', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${cfg.resendApiKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(15000),
-  });
-
-  if (!res.ok) {
-    const errBody = await res.text();
-    throw new Error(`Resend API ${res.status}: ${errBody.slice(0, 200)}`);
-  }
-}
-
-async function sendViaSmtpWithFallback(
-  payload: OutgoingEmailPayload,
-  cfg: EffectiveEmailRuntimeConfig,
-): Promise<void> {
-  const primaryTransport = createSmtpTransport(cfg, cfg.smtpPort);
-  if (!primaryTransport) {
-    throw new Error('Email SMTP credentials (EMAIL_HOST_USER / EMAIL_HOST_PASSWORD) are not configured.');
-  }
-
-  const mailOptions = {
-    from: `"${payload.senderName}" <${payload.fromEmail}>`,
-    to: payload.to,
-    subject: payload.subject,
-    text: payload.text,
-    html: payload.html,
-    attachments: payload.attachments,
-  };
-
-  try {
-    await primaryTransport.sendMail(mailOptions);
-  } catch (primaryErr) {
-    const msg = primaryErr instanceof Error ? primaryErr.message : String(primaryErr);
-    const isNetworkTimeout =
-      /timeout|ETIMEDOUT|ECONNREFUSED|ENETUNREACH|EHOSTUNREACH/i.test(msg);
-
-    // Retry once on alternate SSL/TLS port (465 vs 587) before failing
-    const altPort = cfg.smtpPort === 465 ? 587 : 465;
-    if (isNetworkTimeout) {
-      const altTransport = createSmtpTransport(cfg, altPort);
-      if (altTransport) {
-        try {
-          await altTransport.sendMail(mailOptions);
-          return;
-        } catch {
-          throw new Error(
-            `${msg} — Outbound SMTP ports 465/587 are blocked on free cloud hosting. Configure an HTTPS provider (EMAIL_WEBHOOK_URL or BREVO_API_KEY) in Admin Settings or Environment Variables.`,
-          );
-        }
-      }
-    }
-    throw primaryErr;
-  }
-}
-
 async function dispatchOutgoingEmail(
   payload: OutgoingEmailPayload,
   cfgOverride?: EffectiveEmailRuntimeConfig,
-): Promise<{dispatched: boolean; provider: EmailProviderKind; error?: string}> {
+) {
   const cfg = cfgOverride ?? (await getEffectiveEmailDeliveryConfig());
-  if (!cfg.configured) {
-    return {
-      dispatched: false,
-      provider: 'console',
-      error:
-        'No email delivery provider is configured. Configure EMAIL_WEBHOOK_URL, BREVO_API_KEY, RESEND_API_KEY, or SMTP credentials in Admin Portal → System Settings (or in deployment Environment Variables).',
-    };
-  }
-
-  try {
-    if (cfg.mode === 'https-webhook') {
-      await sendViaAppsScriptWebhook(payload, cfg);
-      return {dispatched: true, provider: 'https-webhook'};
-    }
-    if (cfg.mode === 'brevo-https') {
-      await sendViaBrevoHttps(payload, cfg);
-      return {dispatched: true, provider: 'brevo-https'};
-    }
-    if (cfg.mode === 'resend-https') {
-      await sendViaResendHttps(payload, cfg);
-      return {dispatched: true, provider: 'resend-https'};
-    }
-    await sendViaSmtpWithFallback(payload, cfg);
-    return {dispatched: true, provider: 'gmail-smtp'};
-  } catch (err) {
-    return {
-      dispatched: false,
-      provider: cfg.mode,
-      error: err instanceof Error ? err.message : 'Email delivery failed',
-    };
-  }
+  return defaultEmailDeliveryService.send(payload, cfg);
 }
 
 export async function sendTestEmail(
   recipientEmail: string,
-): Promise<{success: boolean; provider: EmailProviderKind; recipient: string; error?: string}> {
+): Promise<{
+  success: boolean;
+  provider: EmailProviderKind;
+  attemptedProviders?: EmailProviderKind[];
+  switchedOver?: boolean;
+  recipient: string;
+  error?: string;
+}> {
   const cfg = await getEffectiveEmailDeliveryConfig();
   const result = await dispatchOutgoingEmail(
     {
@@ -509,6 +262,8 @@ export async function sendTestEmail(
   return {
     success: result.dispatched,
     provider: result.provider,
+    attemptedProviders: result.attemptedProviders,
+    switchedOver: result.switchedOver,
     recipient: recipientEmail,
     ...(result.error ? {error: result.error} : {}),
   };
@@ -567,7 +322,10 @@ export async function sendVerificationOtpEmail(
 
   return {
     dispatched: result.dispatched,
+    configured: cfg.configured,
     provider: result.provider,
+    attemptedProviders: result.attemptedProviders,
+    switchedOver: result.switchedOver,
     recipient: recipientEmail,
     ...(result.error ? {error: result.error} : {}),
   };

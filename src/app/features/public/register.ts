@@ -631,11 +631,13 @@ export class Register implements OnInit, OnDestroy {
         this.emailNotice.set(notice);
         this.toast.success('Email OTP Sent', `Verification code sent to ${email}.`);
       } else if (res.devOtpHint) {
-        const notice = `Email delivery unavailable (${res.emailError || 'SMTP unavailable'}). Use the verification code below to continue.`;
+        const notice =
+          res.message ||
+          'External email relay is not configured on this runtime — use the 6-digit verification code below to continue.';
         this.emailNotice.set(notice);
         this.toast.info('Verification Code Ready', 'Use the on-screen 6-digit code to verify your email and continue.');
       } else {
-        const notice = `Could not deliver verification email (${res.emailError || 'SMTP unavailable'}).`;
+        const notice = `Could not deliver verification email (${res.emailError || 'Email service unavailable'}).`;
         this.emailNotice.set(notice);
         this.toast.error('Email Delivery Notice', notice);
       }

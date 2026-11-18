@@ -595,13 +595,19 @@ export function createApiRouter(): express.Router {
       );
 
       const isNonProd = process.env['NODE_ENV'] !== 'production';
-      const allowHintSetting = (getEnvValue('ALLOW_DEV_OTP_HINT') || 'true').toLowerCase() === 'true';
+      const hintSettingRaw = getEnvValue('ALLOW_DEV_OTP_HINT').toLowerCase();
+      const requireExternalEmail = getEnvValue('REQUIRE_EXTERNAL_EMAIL').toLowerCase() === 'true';
+      const hintAllowedByConfig =
+        hintSettingRaw === 'true' || (hintSettingRaw !== 'false' && !requireExternalEmail);
+
+      // Registration allows graceful on-screen verification fallback when published without an email relay configured yet,
+      // unless strict external email delivery is enforced. Password reset only allows on-screen hint in non-prod/test or explicit opt-in.
       const allowDevHint =
-        purpose === 'PASSWORD_RESET'
-          ? isNonProd && allowHintSetting && (!emailResult.dispatched || Boolean(process.env['VITEST']))
-          : allowHintSetting &&
-            (isNonProd || getEnvValue('ALLOW_DEV_OTP_HINT').toLowerCase() === 'true') &&
-            (!emailResult.dispatched || Boolean(process.env['VITEST']));
+        (!emailResult.dispatched || Boolean(process.env['VITEST'])) &&
+        hintAllowedByConfig &&
+        (purpose === 'REGISTRATION'
+          ? !emailResult.configured || isNonProd || hintSettingRaw === 'true'
+          : isNonProd || hintSettingRaw === 'true');
 
       if (!emailResult.dispatched && isNonProd) {
         console.log(
@@ -615,9 +621,12 @@ export function createApiRouter(): express.Router {
         expiresInSeconds: expiryMinutes * 60,
         message: emailResult.dispatched
           ? `Verification code sent to ${email}.`
-          : `Verification code generated, but email could not be delivered (${emailResult.error || 'Email service unavailable'}).`,
+          : allowDevHint
+            ? `Email relay not configured on this runtime — use the one-time verification code to continue.`
+            : `Verification code generated, but email could not be delivered (${emailResult.error || 'Email service unavailable'}).`,
         emailProvider: emailResult.provider,
         emailDispatched: emailResult.dispatched,
+        emailConfigured: emailResult.configured,
         emailError: emailResult.error || null,
         ...(allowDevHint ? {devOtpHint: otp} : {}),
       });

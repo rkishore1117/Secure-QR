@@ -12,6 +12,11 @@ import {
   verifyPassword,
 } from './crypto';
 import {ensureSeeded} from './db';
+import {
+  EmailDeliveryService,
+  type EmailTransport,
+  type EmailTransportContext,
+} from './email-transport';
 import {createApiRouter} from './routes';
 
 async function requestJson(
@@ -93,6 +98,80 @@ describe('Secure QR Verification System — Crypto & API Integration', () => {
     expect(decoded?.sub).toBe(1);
     expect(decoded?.role).toBe('SUPER_ADMIN');
     expect(verifyAccessToken(`${jwt}tampered`)).toBeNull();
+  });
+
+  it('switches automatically between SMTP and HTTPS relays based on availability and failover', async () => {
+    const baseCtx: EmailTransportContext = {
+      configured: true,
+      mode: 'gmail-smtp',
+      configSource: 'env',
+      preferredProvider: 'gmail-smtp',
+      smtpConfigured: true,
+      httpsConfigured: true,
+      isCloudRuntime: true,
+      webhookUrl: '',
+      webhookSecret: '',
+      brevoApiKey: 'test-brevo-key',
+      resendApiKey: '',
+      resendFromEmail: '',
+      smtpHost: 'smtp.gmail.com',
+      smtpPort: 587,
+      smtpUseTls: true,
+      smtpUser: 'sender@example.com',
+      smtpPassword: 'app-password',
+      defaultFromEmail: 'sender@example.com',
+    };
+
+    const failingSmtp: EmailTransport = {
+      kind: 'gmail-smtp',
+      transportType: 'smtp',
+      displayName: 'Mock SMTP',
+      isAvailable: (ctx) => Boolean(ctx.smtpUser && ctx.smtpPassword),
+      send: async () => {
+        throw new Error('ETIMEDOUT port 587 blocked on free tier');
+      },
+    };
+    const workingBrevo: EmailTransport = {
+      kind: 'brevo-https',
+      transportType: 'https',
+      displayName: 'Mock Brevo HTTPS',
+      isAvailable: (ctx) => Boolean(ctx.brevoApiKey),
+      send: async () => {
+        return;
+      },
+    };
+
+    const svc = new EmailDeliveryService([failingSmtp, workingBrevo]);
+    const payload = {
+      fromEmail: 'sender@example.com',
+      senderName: 'Secure QR',
+      to: 'member@example.com',
+      subject: 'Test',
+      text: 'Hello',
+      html: '<p>Hello</p>',
+    };
+
+    // 1. Fails over from preferred SMTP timeout to Brevo HTTPS automatically
+    const failoverRes = await svc.send(payload, baseCtx);
+    expect(failoverRes.dispatched).toBe(true);
+    expect(failoverRes.provider).toBe('brevo-https');
+    expect(failoverRes.switchedOver).toBe(true);
+    expect(failoverRes.attemptedProviders).toEqual(['gmail-smtp', 'brevo-https']);
+
+    // 2. Without explicit SMTP preference, prioritizes HTTPS relays first
+    const defaultChain = svc.resolveTransportChain({...baseCtx, preferredProvider: ''});
+    expect(defaultChain.map((t) => t.kind)).toEqual(['brevo-https', 'gmail-smtp']);
+
+    // 3. Returns clean unconfigured outcome when neither transport has credentials
+    const noneRes = await svc.send(payload, {
+      ...baseCtx,
+      brevoApiKey: '',
+      smtpUser: '',
+      smtpPassword: '',
+      configured: false,
+    });
+    expect(noneRes.dispatched).toBe(false);
+    expect(noneRes.provider).toBe('console');
   });
 
   it('enforces RBAC, completes OTP -> Registration -> Admin Approval -> QR Verification -> Revoke -> Excel Export', async () => {
