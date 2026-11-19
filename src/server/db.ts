@@ -45,10 +45,22 @@ function parseDotEnvFile(): Record<string, string> {
   return parsed;
 }
 
+function stripSurroundingQuotes(raw: string): string {
+  const trimmed = raw.trim();
+  if (
+    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'"))
+  ) {
+    return trimmed.slice(1, -1).trim();
+  }
+  return trimmed;
+}
+
 export function getEnvValue(key: string): string {
   const procRaw = process.env[key];
+  const procClean = procRaw !== undefined ? stripSurroundingQuotes(procRaw) : undefined;
   const procVal =
-    procRaw !== undefined && !isPlaceholderEnvValue(procRaw) ? procRaw.trim() : undefined;
+    procClean !== undefined && !isPlaceholderEnvValue(procClean) ? procClean : undefined;
 
   if (process.env['VITEST'] && key in process.env) {
     return procVal ?? '';
@@ -56,8 +68,9 @@ export function getEnvValue(key: string): string {
 
   const dotEnv = parseDotEnvFile();
   const fileRaw = dotEnv[key];
+  const fileClean = fileRaw !== undefined ? stripSurroundingQuotes(fileRaw) : undefined;
   const fileVal =
-    fileRaw !== undefined && !isPlaceholderEnvValue(fileRaw) ? fileRaw.trim() : undefined;
+    fileClean !== undefined && !isPlaceholderEnvValue(fileClean) ? fileClean : undefined;
 
   if (fileVal) return fileVal;
   if (procVal) return procVal;
@@ -77,6 +90,36 @@ export function sanitizeDbName(name: string): string {
   return cleaned || 'secure_qr_verification';
 }
 
+export function getMysqlSslOptions(): mysql.SslOptions | undefined {
+  const sslSetting = getEnvValue('DB_SSL').toLowerCase();
+  const host = getEnvValue('DB_HOST').toLowerCase();
+  if (sslSetting === 'false' || sslSetting === '0') {
+    return undefined;
+  }
+  const caPath = getEnvValue('DB_SSL_CA');
+  if (caPath && fs.existsSync(caPath)) {
+    return {
+      ca: fs.readFileSync(caPath, 'utf8'),
+      rejectUnauthorized: getEnvValue('DB_SSL_REJECT_UNAUTHORIZED').toLowerCase() !== 'false',
+    };
+  }
+  if (sslSetting === 'true' || sslSetting === '1' || host.includes('.rds.amazonaws.com')) {
+    return {
+      rejectUnauthorized: getEnvValue('DB_SSL_REJECT_UNAUTHORIZED').toLowerCase() === 'true',
+    };
+  }
+  return undefined;
+}
+
+export function isStrictLiveDbRequired(): boolean {
+  if (process.env['VITEST']) return false;
+  return (
+    getEnvValue('REQUIRE_LIVE_DB').toLowerCase() === 'true' ||
+    getEnvValue('STRICT_PRODUCTION_CONFIG').toLowerCase() === 'true' ||
+    Boolean(process.env['RENDER'] || process.env['RENDER_SERVICE_ID'])
+  );
+}
+
 export function getMysqlConfig() {
   loadEnvSafe();
   const host = getEnvValue('DB_HOST');
@@ -84,7 +127,8 @@ export function getMysqlConfig() {
   const user = getEnvValue('DB_USER');
   const password = getEnvValue('DB_PASSWORD');
   const database = sanitizeDbName(getEnvValue('DB_NAME') || 'secure_qr_verification');
-  return {host, port, user, password, database};
+  const ssl = getMysqlSslOptions();
+  return {host, port, user, password, database, ssl};
 }
 
 export function getUploadsDir(): string {
@@ -138,6 +182,11 @@ export function getPool(): mysql.Pool {
   if (poolInstance) return poolInstance;
   const cfg = getMysqlConfig();
   if (!cfg.host || !cfg.user) {
+    if (isStrictLiveDbRequired()) {
+      throw new Error(
+        'Missing required AWS RDS MySQL environment variables (DB_HOST, DB_USER, DB_PASSWORD, DB_NAME).',
+      );
+    }
     activateMockMode('MySQL RDS credentials not configured');
     return {
       query: async () => [[], []],
@@ -152,11 +201,12 @@ export function getPool(): mysql.Pool {
     user: cfg.user,
     password: cfg.password,
     database: cfg.database,
+    ...(cfg.ssl ? {ssl: cfg.ssl} : {}),
     waitForConnections: true,
     connectionLimit: 10,
     queueLimit: 0,
     timezone: 'Z',
-    connectTimeout: 5000,
+    connectTimeout: 8000,
   });
   return poolInstance;
 }
@@ -457,34 +507,70 @@ export async function ensureDbInitialized(): Promise<void> {
   initPromise = (async () => {
     const cfg = getMysqlConfig();
     if (!cfg.host || !cfg.user) {
+      if (isStrictLiveDbRequired()) {
+        throw new Error(
+          'Live AWS RDS MySQL credentials (DB_HOST, DB_USER, DB_PASSWORD, DB_NAME) are missing in production environment variables.',
+        );
+      }
       activateMockMode('MySQL RDS credentials not configured');
       return;
     }
 
     let bootstrapConn: mysql.Connection;
+    let connectedToDatabaseDirectly = false;
     try {
       bootstrapConn = await mysql.createConnection({
         host: cfg.host,
         port: cfg.port,
         user: cfg.user,
         password: cfg.password,
-        connectTimeout: 5000,
+        database: cfg.database,
+        ...(cfg.ssl ? {ssl: cfg.ssl} : {}),
+        connectTimeout: 8000,
         multipleStatements: true,
       });
-    } catch (err) {
-      activateMockMode(
-        `MySQL connection failed (${err instanceof Error ? err.message : 'unreachable'})`,
-      );
-      return;
+      connectedToDatabaseDirectly = true;
+    } catch (directErr) {
+      const code = (directErr as {code?: string})?.code;
+      if (code === 'ER_BAD_DB_ERROR') {
+        try {
+          bootstrapConn = await mysql.createConnection({
+            host: cfg.host,
+            port: cfg.port,
+            user: cfg.user,
+            password: cfg.password,
+            ...(cfg.ssl ? {ssl: cfg.ssl} : {}),
+            connectTimeout: 8000,
+            multipleStatements: true,
+          });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : 'unreachable';
+          if (isStrictLiveDbRequired() || (process.env['NODE_ENV'] === 'production' && !process.env['K_SERVICE'])) {
+            throw new Error(`AWS RDS MySQL connection failed (${msg})`);
+          }
+          activateMockMode(`MySQL connection failed (${msg})`);
+          return;
+        }
+      } else {
+        const msg = directErr instanceof Error ? directErr.message : 'unreachable';
+        if (isStrictLiveDbRequired() || (process.env['NODE_ENV'] === 'production' && !process.env['K_SERVICE'])) {
+          throw new Error(`AWS RDS MySQL connection failed (${msg})`);
+        }
+        activateMockMode(`MySQL connection failed (${msg})`);
+        return;
+      }
     }
 
     try {
-      const batchSql = [
-        `CREATE DATABASE IF NOT EXISTS \`${cfg.database}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;`,
-        `USE \`${cfg.database}\`;`,
-        ...MYSQL_DDL_STATEMENTS,
-      ].join('\n');
-      await bootstrapConn.query(batchSql);
+      const statements: string[] = [];
+      if (!connectedToDatabaseDirectly) {
+        statements.push(
+          `CREATE DATABASE IF NOT EXISTS \`${cfg.database}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;`,
+          `USE \`${cfg.database}\`;`,
+        );
+      }
+      statements.push(...MYSQL_DDL_STATEMENTS);
+      await bootstrapConn.query(statements.join('\n'));
 
       // Safely upgrade any tables previously created without newer columns
       const [colRows] = await bootstrapConn.query(

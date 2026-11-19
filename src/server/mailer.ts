@@ -226,6 +226,16 @@ async function dispatchOutgoingEmail(
   return defaultEmailDeliveryService.send(payload, cfg);
 }
 
+export async function checkEmailProviderHealth() {
+  const cfg = await getEffectiveEmailDeliveryConfig();
+  const result = await defaultEmailDeliveryService.verifyPrimaryProvider(cfg);
+  return {
+    ...result,
+    configSource: cfg.configSource,
+    checkedAt: new Date().toISOString(),
+  };
+}
+
 export async function sendTestEmail(
   recipientEmail: string,
 ): Promise<{

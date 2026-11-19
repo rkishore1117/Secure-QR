@@ -18,6 +18,7 @@ import {
 } from './db';
 import {buildVerifiedUsersWorkbook} from './excel';
 import {
+  checkEmailProviderHealth,
   EMAIL_SETTINGS_KEYS,
   getEffectiveEmailDeliveryConfig,
   getEmailSettingsMaskedSummary,
@@ -629,6 +630,14 @@ export function createApiRouter(): express.Router {
         });
         return;
       }
+
+      // Supersede any earlier unused OTPs for this email & purpose so only the latest code is valid
+      await executeSql(
+        `UPDATE otp_verifications
+         SET used_at = ?
+         WHERE LOWER(email) = ? AND purpose = ? AND used_at IS NULL AND id < ?`,
+        [toMysqlDateTime(now), email, purpose, Number(insertRes.insertId)],
+      );
 
       if (!emailResult.dispatched && isTestRuntime) {
         console.log(
@@ -2834,15 +2843,39 @@ export function createApiRouter(): express.Router {
     });
   });
 
+  // Admin-only connectivity check for AWS RDS MySQL & active Email Provider
+  router.get(
+    '/admin/health',
+    requireAuth,
+    requireAdmin,
+    async (req: AuthenticatedRequest, res: Response) => {
+      const [mysqlStatus, emailHealth] = await Promise.all([
+        checkMysqlConnection(),
+        checkEmailProviderHealth(),
+      ]);
+      const ok = Boolean(mysqlStatus.connected && emailHealth.healthy);
+      const strict = String(req.query['strict'] || '').toLowerCase() === 'true';
+      res.status(strict && !ok ? 503 : 200).json({
+        ok,
+        database: mysqlStatus,
+        email: emailHealth,
+        checkedAt: new Date().toISOString(),
+      });
+    },
+  );
+
   router.get(
     '/admin/settings/db-status',
     requireAuth,
     requireSuperAdmin,
     async (_req: AuthenticatedRequest, res: Response) => {
-      const mysqlStatus = await checkMysqlConnection();
+      const [mysqlStatus, emailCfg, emailSummary, emailHealth] = await Promise.all([
+        checkMysqlConnection(),
+        getEffectiveEmailDeliveryConfig(),
+        getEmailSettingsMaskedSummary(),
+        checkEmailProviderHealth(),
+      ]);
       const cfg = getMysqlConfig();
-      const emailCfg = await getEffectiveEmailDeliveryConfig();
-      const emailSummary = await getEmailSettingsMaskedSummary();
       res.json({
         database: {
           ...mysqlStatus,
@@ -2871,6 +2904,7 @@ export function createApiRouter(): express.Router {
           fixedAdminEmail: getEnvValue('FIXED_ADMIN_EMAIL') || 'kishore.sathayush@gmail.com',
         },
         emailSettings: emailSummary,
+        emailHealth,
       });
     },
   );

@@ -58,6 +58,65 @@ export interface EmailDispatchOutcome {
   error?: string;
 }
 
+export interface EmailProviderHealthResult {
+  configured: boolean;
+  healthy: boolean;
+  provider: EmailProviderKind;
+  detail: string;
+}
+
+function sanitizeEmailErrorMessage(raw: string, ctx: EmailTransportContext): string {
+  let clean = raw;
+  const secrets = [ctx.brevoApiKey, ctx.resendApiKey, ctx.webhookSecret, ctx.smtpPassword];
+  for (const s of secrets) {
+    if (s && s.length >= 4) {
+      clean = clean.split(s).join('[REDACTED]');
+    }
+  }
+  return clean.slice(0, 300);
+}
+
+function isRetryableStatus(status: number): boolean {
+  return status === 429 || status >= 500;
+}
+
+function isRetryableNetworkError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /timeout|abort|ETIMEDOUT|ECONNRESET|ECONNREFUSED|ENETUNREACH|EAI_AGAIN|fetch failed/i.test(
+    msg,
+  );
+}
+
+async function fetchWithRetry(
+  url: string,
+  init: RequestInit,
+  timeoutMs = 12000,
+  maxAttempts = 2,
+): Promise<Response> {
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const res = await fetch(url, {
+        ...init,
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (!res.ok && isRetryableStatus(res.status) && attempt < maxAttempts) {
+        await new Promise((r) => setTimeout(r, 400 * attempt));
+        continue;
+      }
+      return res;
+    } catch (err) {
+      lastErr = err;
+      if (attempt < maxAttempts && isRetryableNetworkError(err)) {
+        await new Promise((r) => setTimeout(r, 400 * attempt));
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error('HTTPS email request failed');
+}
+
 /**
  * Abstraction implemented by every concrete email transport (HTTPS relays & SMTP).
  */
@@ -67,6 +126,7 @@ export interface EmailTransport {
   readonly displayName: string;
   isAvailable(ctx: EmailTransportContext): boolean;
   send(payload: OutgoingEmailPayload, ctx: EmailTransportContext): Promise<void>;
+  verify?(ctx: EmailTransportContext): Promise<{healthy: boolean; detail: string}>;
 }
 
 /**
@@ -81,12 +141,19 @@ export class AppsScriptWebhookTransport implements EmailTransport {
     return Boolean(ctx.webhookUrl && /^https?:\/\//i.test(ctx.webhookUrl));
   }
 
+  async verify(ctx: EmailTransportContext): Promise<{healthy: boolean; detail: string}> {
+    if (!this.isAvailable(ctx)) {
+      return {healthy: false, detail: 'EMAIL_WEBHOOK_URL is not configured.'};
+    }
+    return {healthy: true, detail: 'Apps Script HTTPS webhook endpoint URL configured.'};
+  }
+
   async send(payload: OutgoingEmailPayload, ctx: EmailTransportContext): Promise<void> {
     if (!ctx.webhookUrl) {
       throw new Error('EMAIL_WEBHOOK_URL is not configured.');
     }
 
-    const res = await fetch(ctx.webhookUrl, {
+    const res = await fetchWithRetry(ctx.webhookUrl, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({
@@ -102,7 +169,6 @@ export class AppsScriptWebhookTransport implements EmailTransport {
           base64: att.content.toString('base64'),
         })),
       }),
-      signal: AbortSignal.timeout(15000),
     });
 
     const bodyText = await res.text();
@@ -131,7 +197,7 @@ export class AppsScriptWebhookTransport implements EmailTransport {
 
 /**
  * Brevo (formerly Sendinblue) Transactional Email API over HTTPS (Port 443).
- * Ideal for Render Free Tier where outbound SMTP ports 465/587 are blocked.
+ * Preferred provider for cloud runtimes (Render Free Tier / Cloud Run) where SMTP ports 465/587 are blocked.
  */
 export class BrevoHttpsTransport implements EmailTransport {
   readonly kind = 'brevo-https' as const;
@@ -140,6 +206,38 @@ export class BrevoHttpsTransport implements EmailTransport {
 
   isAvailable(ctx: EmailTransportContext): boolean {
     return Boolean(ctx.brevoApiKey);
+  }
+
+  async verify(ctx: EmailTransportContext): Promise<{healthy: boolean; detail: string}> {
+    if (!ctx.brevoApiKey) {
+      return {healthy: false, detail: 'BREVO_API_KEY is not configured.'};
+    }
+    try {
+      const res = await fetchWithRetry(
+        'https://api.brevo.com/v3/account',
+        {
+          method: 'GET',
+          headers: {
+            'api-key': ctx.brevoApiKey,
+            Accept: 'application/json',
+          },
+        },
+        6000,
+        2,
+      );
+      if (!res.ok) {
+        return {healthy: false, detail: `Brevo authentication failed (HTTP ${res.status}).`};
+      }
+      return {healthy: true, detail: 'Brevo HTTPS API key authenticated and reachable.'};
+    } catch (err) {
+      return {
+        healthy: false,
+        detail: sanitizeEmailErrorMessage(
+          err instanceof Error ? err.message : 'Brevo API unreachable',
+          ctx,
+        ),
+      };
+    }
   }
 
   async send(payload: OutgoingEmailPayload, ctx: EmailTransportContext): Promise<void> {
@@ -162,7 +260,7 @@ export class BrevoHttpsTransport implements EmailTransport {
       }));
     }
 
-    const res = await fetch('https://api.brevo.com/v3/smtp/email', {
+    const res = await fetchWithRetry('https://api.brevo.com/v3/smtp/email', {
       method: 'POST',
       headers: {
         'api-key': ctx.brevoApiKey,
@@ -170,7 +268,6 @@ export class BrevoHttpsTransport implements EmailTransport {
         Accept: 'application/json',
       },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(15000),
     });
 
     if (!res.ok) {
@@ -190,6 +287,37 @@ export class ResendHttpsTransport implements EmailTransport {
 
   isAvailable(ctx: EmailTransportContext): boolean {
     return Boolean(ctx.resendApiKey);
+  }
+
+  async verify(ctx: EmailTransportContext): Promise<{healthy: boolean; detail: string}> {
+    if (!ctx.resendApiKey) {
+      return {healthy: false, detail: 'RESEND_API_KEY is not configured.'};
+    }
+    try {
+      const res = await fetchWithRetry(
+        'https://api.resend.com/domains',
+        {
+          method: 'GET',
+          headers: {
+            Authorization: `Bearer ${ctx.resendApiKey}`,
+          },
+        },
+        6000,
+        2,
+      );
+      if (!res.ok) {
+        return {healthy: false, detail: `Resend authentication failed (HTTP ${res.status}).`};
+      }
+      return {healthy: true, detail: 'Resend HTTPS API key authenticated and reachable.'};
+    } catch (err) {
+      return {
+        healthy: false,
+        detail: sanitizeEmailErrorMessage(
+          err instanceof Error ? err.message : 'Resend API unreachable',
+          ctx,
+        ),
+      };
+    }
   }
 
   async send(payload: OutgoingEmailPayload, ctx: EmailTransportContext): Promise<void> {
@@ -213,14 +341,13 @@ export class ResendHttpsTransport implements EmailTransport {
       }));
     }
 
-    const res = await fetch('https://api.resend.com/emails', {
+    const res = await fetchWithRetry('https://api.resend.com/emails', {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${ctx.resendApiKey}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(15000),
     });
 
     if (!res.ok) {
@@ -261,6 +388,30 @@ export class SmtpNodemailerTransport implements EmailTransport {
         pass,
       },
     });
+  }
+
+  async verify(ctx: EmailTransportContext): Promise<{healthy: boolean; detail: string}> {
+    if (!this.isAvailable(ctx)) {
+      return {
+        healthy: false,
+        detail: 'SMTP credentials (EMAIL_HOST_USER / EMAIL_HOST_PASSWORD) are not configured.',
+      };
+    }
+    try {
+      await this.createTransport(ctx, ctx.smtpPort).verify();
+      return {
+        healthy: true,
+        detail: `SMTP handshake verified (${ctx.smtpHost}:${ctx.smtpPort}).`,
+      };
+    } catch (err) {
+      return {
+        healthy: false,
+        detail: sanitizeEmailErrorMessage(
+          err instanceof Error ? err.message : 'SMTP verification failed',
+          ctx,
+        ),
+      };
+    }
   }
 
   async send(payload: OutgoingEmailPayload, ctx: EmailTransportContext): Promise<void> {
@@ -319,7 +470,7 @@ export class EmailDeliveryService {
   /**
    * Orders available transports cleanly:
    * 1. Explicit preferred provider (if available), EXCEPT on cloud runtimes where HTTPS relays
-   *    are prioritized if preferred isn't explicitly forcing SMTP over an available HTTPS relay.
+   *    are prioritized when preferred is unset.
    * 2. All HTTPS relays (Brevo, Apps Script, Resend) — guaranteed to work over port 443 on Render Free.
    * 3. SMTP fallback — works locally and on VPS/paid instances with open ports 587/465.
    */
@@ -337,7 +488,6 @@ export class EmailDeliveryService {
     if (ctx.preferredProvider) {
       const preferred = available.find((t) => t.kind === ctx.preferredProvider);
       if (preferred) {
-        // On cloud free runtimes (Render/Cloud Run), prefer HTTPS if both HTTPS & SMTP exist unless user explicitly saved gmail-smtp
         pushIfNew(preferred);
       }
     }
@@ -355,12 +505,61 @@ export class EmailDeliveryService {
     return ordered;
   }
 
+  async verifyPrimaryProvider(ctx: EmailTransportContext): Promise<EmailProviderHealthResult> {
+    const chain = this.resolveTransportChain(ctx);
+    if (chain.length === 0) {
+      return {
+        configured: false,
+        healthy: false,
+        provider: 'console',
+        detail:
+          'No email delivery provider is configured (set BREVO_API_KEY, EMAIL_WEBHOOK_URL, RESEND_API_KEY, or SMTP credentials).',
+      };
+    }
+
+    for (const transport of chain) {
+      if (!transport.verify) {
+        return {
+          configured: true,
+          healthy: true,
+          provider: transport.kind,
+          detail: `${transport.displayName} is configured.`,
+        };
+      }
+      const check = await transport.verify(ctx);
+      if (check.healthy) {
+        return {
+          configured: true,
+          healthy: true,
+          provider: transport.kind,
+          detail: check.detail,
+        };
+      }
+      if (transport === chain[chain.length - 1]) {
+        return {
+          configured: true,
+          healthy: false,
+          provider: transport.kind,
+          detail: check.detail,
+        };
+      }
+    }
+
+    return {
+      configured: true,
+      healthy: false,
+      provider: chain[0]?.kind ?? 'console',
+      detail: 'Email provider verification failed.',
+    };
+  }
+
   async send(
     payload: OutgoingEmailPayload,
     ctx: EmailTransportContext,
   ): Promise<EmailDispatchOutcome> {
     const chain = this.resolveTransportChain(ctx);
     if (chain.length === 0) {
+      console.error('[EMAIL DELIVERY ERROR] No email provider configured.');
       return {
         dispatched: false,
         provider: 'console',
@@ -373,6 +572,7 @@ export class EmailDeliveryService {
 
     const attempted: EmailProviderKind[] = [];
     const errors: string[] = [];
+    const recipientDomain = payload.to.includes('@') ? payload.to.split('@')[1] : 'unknown';
 
     for (let i = 0; i < chain.length; i++) {
       const transport = chain[i];
@@ -386,7 +586,13 @@ export class EmailDeliveryService {
           switchedOver: i > 0,
         };
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
+        const msg = sanitizeEmailErrorMessage(
+          err instanceof Error ? err.message : String(err),
+          ctx,
+        );
+        console.error(
+          `[EMAIL DELIVERY FAILURE] provider=${transport.kind} recipientDomain=${recipientDomain} error=${msg}`,
+        );
         errors.push(`${transport.displayName}: ${msg}`);
       }
     }

@@ -19,7 +19,7 @@ export interface MysqlInitResult {
 }
 
 export async function checkMysqlConnection(): Promise<MysqlHealthResult> {
-  const {host, port, user, password, database} = getMysqlConfig();
+  const {host, port, user, password, database, ssl} = getMysqlConfig();
 
   if (!host || !user || isMockDbActive()) {
     const countRow = await queryOne<{cnt: number}>('SELECT COUNT(*) as cnt FROM user_accounts').catch(
@@ -44,7 +44,8 @@ export async function checkMysqlConnection(): Promise<MysqlHealthResult> {
       user,
       password,
       database,
-      connectTimeout: 5000,
+      ...(ssl ? {ssl} : {}),
+      connectTimeout: 8000,
     });
     await conn.ping();
     await conn.end();
@@ -58,8 +59,8 @@ export async function checkMysqlConnection(): Promise<MysqlHealthResult> {
       database,
       activeEngine:
         countRow !== undefined
-          ? `mysql-rds-active (${Number(countRow.cnt)} accounts)`
-          : 'mysql-rds-connected',
+          ? `mysql-rds-active (${Number(countRow.cnt)} accounts${ssl ? ', tls' : ''})`
+          : `mysql-rds-connected${ssl ? ' (tls)' : ''}`,
     };
   } catch (err) {
     return {

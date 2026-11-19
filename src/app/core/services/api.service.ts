@@ -345,6 +345,14 @@ export class ApiService {
         hasSmtpPassword: boolean;
         defaultFromEmail: string;
       };
+      emailHealth?: {
+        configured: boolean;
+        healthy: boolean;
+        provider: string;
+        configSource: string;
+        detail: string;
+        checkedAt: string;
+      };
     }>('/api/v1/admin/settings/db-status');
   }
 

@@ -164,7 +164,23 @@ describe('Secure QR Verification System — Crypto & API Integration', () => {
     const defaultChain = svc.resolveTransportChain({...baseCtx, preferredProvider: ''});
     expect(defaultChain.map((t) => t.kind)).toEqual(['brevo-https', 'gmail-smtp']);
 
-    // 3. Returns clean unconfigured outcome when neither transport has credentials
+    // 3. Redacts secrets if a transport error echoes them
+    const leakTransport: EmailTransport = {
+      kind: 'brevo-https',
+      transportType: 'https',
+      displayName: 'Leaking Transport',
+      isAvailable: (ctx) => Boolean(ctx.brevoApiKey),
+      send: async (p, ctx) => {
+        throw new Error(`Auth error with key ${ctx.brevoApiKey} for ${p.to}`);
+      },
+    };
+    const leakSvc = new EmailDeliveryService([leakTransport]);
+    const leakRes = await leakSvc.send(payload, {...baseCtx, smtpUser: '', smtpPassword: ''});
+    expect(leakRes.dispatched).toBe(false);
+    expect(leakRes.error).toContain('[REDACTED]');
+    expect(leakRes.error).not.toContain('test-brevo-key');
+
+    // 4. Returns clean unconfigured outcome when neither transport has credentials
     const noneRes = await svc.send(payload, {
       ...baseCtx,
       brevoApiKey: '',
@@ -199,7 +215,7 @@ describe('Secure QR Verification System — Crypto & API Integration', () => {
       expect(dupRes.data['emailAvailable']).toBe(false);
       expect(dupRes.data['mobileAvailable']).toBe(false);
 
-      // 2. Send Email OTP & Verify Email OTP
+      // 2. Send Email OTP, test 30s resend cooldown, test expired OTP rejection, & Verify Email OTP
       const sendOtpRes = await requestJson(baseUrl, '/api/v1/auth/otp/send', {
         method: 'POST',
         body: JSON.stringify({email, purpose: 'REGISTRATION'}),
@@ -211,6 +227,35 @@ describe('Secure QR Verification System — Crypto & API Integration', () => {
       );
       const hintOtp = String(sendOtpRes.data['devOtpHint']);
       expect(hintOtp).toMatch(/^\d{6}$/);
+
+      // Resend immediately must be rejected by 30s cooldown (429)
+      const cooldownRes = await requestJson(baseUrl, '/api/v1/auth/otp/send', {
+        method: 'POST',
+        body: JSON.stringify({email, purpose: 'REGISTRATION'}),
+      });
+      expect(cooldownRes.status).toBe(429);
+
+      // Expired OTP check (temporarily backdate expires_at, confirm 400 expired, then restore)
+      const otpRowId = Number(sendOtpRes.data['otpRequestId']);
+      await executeSql(
+        "UPDATE otp_verifications SET expires_at = '2020-01-01 00:00:00' WHERE id = ?",
+        [otpRowId],
+      );
+      const expiredVerify = await requestJson(baseUrl, '/api/v1/auth/otp/verify', {
+        method: 'POST',
+        body: JSON.stringify({email, otp: hintOtp}),
+      });
+      expect(expiredVerify.status).toBe(400);
+      expect(String(expiredVerify.data['error']).toLowerCase()).toContain('expired');
+
+      const futureIso = new Date(Date.now() + 5 * 60 * 1000)
+        .toISOString()
+        .slice(0, 23)
+        .replace('T', ' ');
+      await executeSql('UPDATE otp_verifications SET expires_at = ? WHERE id = ?', [
+        futureIso,
+        otpRowId,
+      ]);
 
       // Invalid OTP attempt increments failure
       const badVerify = await requestJson(baseUrl, '/api/v1/auth/otp/verify', {
@@ -447,6 +492,7 @@ describe('Secure QR Verification System — Crypto & API Integration', () => {
     const dbInfo = dbStatus.data['database'] as Record<string, unknown>;
     const integrations = dbStatus.data['integrations'] as Record<string, unknown>;
     const emailSettings = dbStatus.data['emailSettings'] as Record<string, unknown>;
+    const emailHealth = dbStatus.data['emailHealth'] as Record<string, unknown>;
     expect(dbInfo['connected']).toBe(true);
     expect(dbInfo['database']).toBe('secure_qr_verification');
     expect(integrations['fixedAdminEmail']).toBe('kishore.sathayush@gmail.com');
@@ -457,6 +503,14 @@ describe('Secure QR Verification System — Crypto & API Integration', () => {
     expect(emailSettings).toBeTruthy();
     expect(typeof emailSettings['hasSmtpPassword']).toBe('boolean');
     expect(emailSettings['smtpPassword']).toBeUndefined();
+    expect(emailHealth['configured']).toBe(true);
+    expect(emailHealth['healthy']).toBe(true);
+
+    const adminHealthRes = await requestJson(baseUrl, '/api/v1/admin/health', {
+      headers: {Authorization: `Bearer ${fixedToken}`},
+    });
+    expect(adminHealthRes.status).toBe(200);
+    expect(adminHealthRes.data['ok']).toBe(true);
 
     const sysSettings = await requestJson(baseUrl, '/api/v1/admin/settings', {
       headers: {Authorization: `Bearer ${fixedToken}`},

@@ -9,6 +9,8 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
+      - key: STRICT_PRODUCTION_CONFIG
+        value: "true"
       - key: APP_URL
         sync: false
       - key: JWT_SECRET
@@ -33,6 +35,8 @@ services:
         sync: false
       - key: DB_PASSWORD
         sync: false
+      - key: DB_SSL
+        value: "true"
       - key: EMAIL_WEBHOOK_URL
         sync: false
       - key: EMAIL_WEBHOOK_SECRET

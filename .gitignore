@@ -1,8 +1,16 @@
 # See https://docs.github.com/get-started/getting-started-with-git/ignoring-files for more about ignoring files.
 
-# Env variables
+# Env variables & secrets
 .env*
 !.env.example
+*.pem
+*.key
+*.crt
+*.p12
+*.sqlite3
+*.db
+/data/uploads/
+/backend/staticfiles/
 
 # Compiled output
 /dist

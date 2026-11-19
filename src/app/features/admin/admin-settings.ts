@@ -370,8 +370,18 @@ import {ToastService} from '../../core/services/toast.service';
               <p class="font-mono text-slate-600 break-all">
                 Sender: {{ status.integrations.smtpUser || 'Not Set' }} · Mode: {{ status.integrations.emailDeliveryMode || 'console' }}
               </p>
-              <p [class.text-emerald-700]="status.integrations.emailOtpConfigured" [class.text-amber-700]="!status.integrations.emailOtpConfigured" class="font-semibold">
-                {{ status.integrations.emailOtpConfigured ? 'Active (Registration & Reset OTP Emails Enabled)' : 'Email Provider Not Configured — Set Gateway Above' }}
+              <p
+                [class.text-emerald-700]="status.emailHealth ? status.emailHealth.healthy : status.integrations.emailOtpConfigured"
+                [class.text-amber-700]="status.emailHealth ? !status.emailHealth.healthy : !status.integrations.emailOtpConfigured"
+                class="font-semibold"
+              >
+                {{
+                  status.emailHealth
+                    ? status.emailHealth.detail
+                    : status.integrations.emailOtpConfigured
+                      ? 'Active (Registration & Reset OTP Emails Enabled)'
+                      : 'Email Provider Not Configured — Set Gateway Above'
+                }}
               </p>
             </div>
 
@@ -428,6 +438,14 @@ export class AdminSettings implements OnInit {
       smtpUser: string;
       hasSmtpPassword: boolean;
       defaultFromEmail: string;
+    };
+    emailHealth?: {
+      configured: boolean;
+      healthy: boolean;
+      provider: string;
+      configSource: string;
+      detail: string;
+      checkedAt: string;
     };
   } | null>(null);
 
