@@ -594,12 +594,12 @@ export class Register implements OnInit, OnDestroy {
         const issues: string[] = [];
         if (!health.databaseConnected) {
           issues.push(
-            'Live MySQL database credentials (DB_HOST, DB_USER, DB_PASSWORD, DB_NAME) are not configured on this host — applications on this instance will not reach your shared AWS RDS Admin Panel.',
+            'Live MySQL RDS credentials (DB_HOST, DB_USER, DB_PASSWORD, DB_NAME) are not configured on this host yet — configure them in Environment Variables or connect RDS under Admin Portal -> System Settings.',
           );
         }
         if (!health.emailConfigured) {
           issues.push(
-            'Email OTP relay (EMAIL_HOST_USER/EMAIL_HOST_PASSWORD or BREVO_API_KEY/EMAIL_WEBHOOK_URL) is not configured on this host.',
+            'Email OTP delivery (BREVO_API_KEY, EMAIL_WEBHOOK_URL, or EMAIL_HOST_USER / EMAIL_HOST_PASSWORD) is not configured on this host yet — configure it in Environment Variables or Admin Portal -> System Settings.',
           );
         }
         this.runtimeNotice.set(issues.join(' '));

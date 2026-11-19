@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import QRCode from 'qrcode';
 import {
+  connectLiveMysqlRuntime,
   ensureFixedAdmin,
   ensureSeeded,
   executeSql,
@@ -3039,6 +3040,118 @@ export function createApiRouter(): express.Router {
       );
 
       res.json(result);
+    },
+  );
+
+  router.post(
+    '/admin/settings/database',
+    requireAuth,
+    requireSuperAdmin,
+    async (req: AuthenticatedRequest, res: Response) => {
+      const b = req.body || {};
+      const result = await connectLiveMysqlRuntime({
+        host: String(b.host || ''),
+        port: Number(b.port || 3306),
+        user: String(b.user || ''),
+        password: String(b.password || ''),
+        database: String(b.database || 'secure_qr_verification'),
+        ssl: b.ssl !== false,
+        awsAccessKeyId: typeof b.awsAccessKeyId === 'string' ? b.awsAccessKeyId : undefined,
+        awsSecretAccessKey:
+          typeof b.awsSecretAccessKey === 'string' ? b.awsSecretAccessKey : undefined,
+        awsRegion: typeof b.awsRegion === 'string' ? b.awsRegion : undefined,
+        awsBucket: typeof b.awsBucket === 'string' ? b.awsBucket : undefined,
+        filePath: typeof b.filePath === 'string' ? b.filePath : undefined,
+      });
+
+      if (!result.success) {
+        res.status(400).json(result);
+        return;
+      }
+
+      // Refresh Super Admin JWT/session against the live RDS user_accounts table
+      const liveAccount = await queryOne<{
+        id: number;
+        email: string;
+        mobile: string;
+        role: 'SUPER_ADMIN' | 'ADMIN' | 'USER';
+      }>(
+        'SELECT id, email, mobile, role FROM user_accounts WHERE LOWER(email) = ? AND deleted_at IS NULL',
+        [req.auth!.email.toLowerCase()],
+      );
+
+      let refreshedSession:
+        | {accessToken: string; refreshToken: string; user: Record<string, unknown>}
+        | undefined;
+      if (liveAccount) {
+        const allPerms = [
+          'can_view_registrations',
+          'can_approve_registrations',
+          'can_manage_qr',
+          'can_scan_qr',
+          'can_export_excel',
+          'can_manage_users',
+        ];
+        const accessToken = signAccessToken(
+          {
+            sub: liveAccount.id,
+            email: liveAccount.email,
+            role: liveAccount.role,
+            permissions: allPerms,
+          },
+          3600,
+        );
+        const refreshToken = generateRefreshToken();
+        const now = new Date();
+        await executeSql(
+          `INSERT INTO refresh_tokens (user_id, token_hash, expires_at, created_at)
+           VALUES (?, ?, ?, ?)`,
+          [
+            liveAccount.id,
+            sha256Hex(refreshToken),
+            toMysqlDateTime(now.getTime() + 7 * 86400000),
+            toMysqlDateTime(now),
+          ],
+        );
+        const profile = await queryOne<{full_name: string; avatar_url: string}>(
+          'SELECT full_name, avatar_url FROM admin_profiles WHERE user_id = ?',
+          [liveAccount.id],
+        );
+        refreshedSession = {
+          accessToken,
+          refreshToken,
+          user: {
+            id: liveAccount.id,
+            email: liveAccount.email,
+            mobile: liveAccount.mobile,
+            role: liveAccount.role,
+            permissions: allPerms,
+            displayName: profile?.full_name || liveAccount.email,
+            avatarUrl:
+              profile?.avatar_url || '/assets/images/avatar_admin_portrait_1794911291825.jpg',
+            registrationId: null,
+            approvalStatus: null,
+          },
+        };
+      }
+
+      await writeAuditLog(
+        {
+          id: liveAccount?.id ?? req.auth!.sub,
+          email: req.auth!.email,
+          role: liveAccount?.role ?? req.auth!.role,
+        },
+        'MYSQL_RDS_RUNTIME_CONNECTED',
+        'DATABASE',
+        result.database,
+        {host: result.host, database: result.database},
+        req.ip,
+      );
+
+      res.json({
+        ...result,
+        ...(refreshedSession || {}),
+      });
     },
   );
 

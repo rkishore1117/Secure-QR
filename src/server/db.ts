@@ -10,6 +10,55 @@ import {
 
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
+const RUNTIME_CONFIG_PATH = path.join(DATA_DIR, 'runtime-config.json');
+let runtimeOverridesCache: Record<string, string> | null = null;
+
+function loadRuntimeOverrides(): Record<string, string> {
+  if (runtimeOverridesCache) return runtimeOverridesCache;
+  try {
+    if (fs.existsSync(RUNTIME_CONFIG_PATH)) {
+      const parsed = JSON.parse(fs.readFileSync(RUNTIME_CONFIG_PATH, 'utf8'));
+      if (parsed && typeof parsed === 'object') {
+        const clean: Record<string, string> = {};
+        for (const [k, v] of Object.entries(parsed)) {
+          if (typeof v === 'string' && v.trim()) {
+            clean[k] = stripSurroundingQuotes(v);
+          }
+        }
+        runtimeOverridesCache = clean;
+        return clean;
+      }
+    }
+  } catch {
+    // ignore invalid runtime-config.json
+  }
+  runtimeOverridesCache = {};
+  return runtimeOverridesCache;
+}
+
+function saveRuntimeOverrides(updates: Record<string, string>): void {
+  const current = {...loadRuntimeOverrides()};
+  for (const [k, v] of Object.entries(updates)) {
+    const clean = stripSurroundingQuotes(v);
+    if (clean) {
+      current[k] = clean;
+    } else if (v === '') {
+      delete current[k];
+    }
+  }
+  runtimeOverridesCache = current;
+  if (!process.env['VITEST']) {
+    try {
+      fs.mkdirSync(DATA_DIR, {recursive: true});
+      fs.writeFileSync(RUNTIME_CONFIG_PATH, JSON.stringify(current, null, 2), {
+        encoding: 'utf8',
+        mode: 0o600,
+      });
+    } catch {
+      // keep in-memory overrides if disk write fails on read-only FS
+    }
+  }
+}
 
 export function isPlaceholderEnvValue(val: string | undefined): boolean {
   if (!val) return false;
@@ -62,8 +111,13 @@ export function getEnvValue(key: string): string {
   const procVal =
     procClean !== undefined && !isPlaceholderEnvValue(procClean) ? procClean : undefined;
 
-  if (process.env['VITEST'] && key in process.env) {
-    return procVal ?? '';
+  if (process.env['VITEST']) {
+    if (key in process.env) {
+      return procVal ?? '';
+    }
+    const rt = runtimeOverridesCache?.[key];
+    if (rt && !isPlaceholderEnvValue(rt)) return rt;
+    return '';
   }
 
   const dotEnv = parseDotEnvFile();
@@ -74,6 +128,11 @@ export function getEnvValue(key: string): string {
 
   if (fileVal) return fileVal;
   if (procVal) return procVal;
+
+  const runtimeVal = loadRuntimeOverrides()[key];
+  if (runtimeVal && !isPlaceholderEnvValue(runtimeVal)) {
+    return runtimeVal;
+  }
   return '';
 }
 
@@ -801,4 +860,139 @@ export async function ensureSeeded(_baseUrl = 'http://localhost:3000'): Promise<
   });
 
   return seedingPromise;
+}
+
+export interface LiveMysqlRuntimeInput {
+  host: string;
+  port?: number;
+  user: string;
+  password: string;
+  database?: string;
+  ssl?: boolean;
+  awsAccessKeyId?: string;
+  awsSecretAccessKey?: string;
+  awsRegion?: string;
+  awsBucket?: string;
+  filePath?: string;
+}
+
+export async function connectLiveMysqlRuntime(input: LiveMysqlRuntimeInput): Promise<{
+  success: boolean;
+  host: string;
+  database: string;
+  message: string;
+  error?: string;
+}> {
+  const host = stripSurroundingQuotes(input.host || '');
+  const port = Number(input.port) || 3306;
+  const user = stripSurroundingQuotes(input.user || '');
+  const password = stripSurroundingQuotes(input.password || '') || getEnvValue('DB_PASSWORD');
+  const database = sanitizeDbName(
+    stripSurroundingQuotes(input.database || '') || 'secure_qr_verification',
+  );
+  const useSsl = input.ssl !== false;
+
+  if (!host || !user || !password) {
+    return {
+      success: false,
+      host,
+      database,
+      message: 'DB Host, DB User, and DB Password are required.',
+      error: 'DB Host, DB User, and DB Password are required.',
+    };
+  }
+
+  const sslOpts: mysql.SslOptions | undefined =
+    useSsl || host.toLowerCase().includes('.rds.amazonaws.com')
+      ? {rejectUnauthorized: false}
+      : undefined;
+
+  let testConn: mysql.Connection | null = null;
+  try {
+    try {
+      testConn = await mysql.createConnection({
+        host,
+        port,
+        user,
+        password,
+        database,
+        ...(sslOpts ? {ssl: sslOpts} : {}),
+        connectTimeout: 8000,
+      });
+      await testConn.ping();
+    } catch (err) {
+      const code = (err as {code?: string})?.code;
+      if (code === 'ER_BAD_DB_ERROR') {
+        testConn = await mysql.createConnection({
+          host,
+          port,
+          user,
+          password,
+          ...(sslOpts ? {ssl: sslOpts} : {}),
+          connectTimeout: 8000,
+        });
+        await testConn.ping();
+      } else {
+        throw err;
+      }
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'Unable to reach AWS RDS MySQL host.';
+    return {
+      success: false,
+      host,
+      database,
+      message: `Could not connect to AWS RDS MySQL (${msg}).`,
+      error: msg,
+    };
+  } finally {
+    if (testConn) {
+      try {
+        await testConn.end();
+      } catch {
+        // ignore connection close errors
+      }
+    }
+  }
+
+  const updates: Record<string, string> = {
+    DB_HOST: host,
+    DB_PORT: String(port),
+    DB_USER: user,
+    DB_PASSWORD: password,
+    DB_NAME: database,
+    DB_SSL: useSsl ? 'true' : 'false',
+  };
+
+  if (input.awsAccessKeyId?.trim()) updates['AWS_ACCESS_KEY_ID'] = input.awsAccessKeyId.trim();
+  if (input.awsSecretAccessKey?.trim()) {
+    updates['AWS_SECRET_ACCESS_KEY'] = input.awsSecretAccessKey.trim();
+  }
+  if (input.awsRegion?.trim()) updates['AWS_S3_REGION_NAME'] = input.awsRegion.trim();
+  if (input.awsBucket?.trim()) updates['AWS_STORAGE_BUCKET_NAME'] = input.awsBucket.trim();
+  if (input.filePath?.trim()) updates['FILE_PATH'] = input.filePath.trim();
+
+  saveRuntimeOverrides(updates);
+
+  if (poolInstance) {
+    try {
+      await poolInstance.end();
+    } catch {
+      // ignore pool close errors
+    }
+    poolInstance = null;
+  }
+  mockMode = false;
+  initPromise = null;
+  seeded = false;
+  seedingPromise = null;
+
+  await ensureSeeded(getEnvValue('APP_URL') || 'http://localhost:3000');
+
+  return {
+    success: true,
+    host,
+    database,
+    message: `Connected to live AWS RDS MySQL (${host} / ${database}) and synchronized schema.`,
+  };
 }

@@ -10,6 +10,7 @@
 *.sqlite3
 *.db
 /data/uploads/
+/data/runtime-config.json
 /backend/staticfiles/
 
 # Compiled output

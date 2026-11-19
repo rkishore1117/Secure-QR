@@ -527,6 +527,13 @@ describe('Secure QR Verification System — Crypto & API Integration', () => {
     });
     expect(badEmailProvider.status).toBe(400);
 
+    const badDbConfig = await requestJson(baseUrl, '/api/v1/admin/settings/database', {
+      method: 'POST',
+      headers: {Authorization: `Bearer ${fixedToken}`},
+      body: JSON.stringify({host: '', user: '', password: ''}),
+    });
+    expect(badDbConfig.status).toBe(400);
+
     const initMysql = await requestJson(baseUrl, '/api/v1/admin/settings/init-mysql', {
       method: 'POST',
       headers: {Authorization: `Bearer ${fixedToken}`},

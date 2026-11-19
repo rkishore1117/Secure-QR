@@ -137,6 +137,20 @@ export class AuthService {
     }
   }
 
+  updateSessionTokens(accessToken: string, refreshToken: string, user?: AuthUser): void {
+    this._accessToken.set(accessToken);
+    if (user) {
+      this._user.set(user);
+    }
+    if (isPlatformBrowser(this.platformId)) {
+      localStorage.setItem(ACCESS_KEY, accessToken);
+      localStorage.setItem(REFRESH_KEY, refreshToken);
+      if (user) {
+        localStorage.setItem(USER_KEY, JSON.stringify(user));
+      }
+    }
+  }
+
   clearSession(): void {
     this._accessToken.set(null);
     this._user.set(null);

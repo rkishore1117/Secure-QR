@@ -3,7 +3,9 @@ import {FormBuilder, ReactiveFormsModule, Validators} from '@angular/forms';
 import {MatIconModule} from '@angular/material/icon';
 import {firstValueFrom} from 'rxjs';
 import {ApiService} from '../../core/services/api.service';
+import {AuthService} from '../../core/services/auth.service';
 import {ToastService} from '../../core/services/toast.service';
+import {AuthUser} from '../../core/models/types';
 
 @Component({
   selector: 'app-admin-settings',
@@ -59,6 +61,82 @@ import {ToastService} from '../../core/services/toast.service';
             >
               <mat-icon class="text-[18px]!">save</mat-icon>
               <span>Save Settings</span>
+            </button>
+          </div>
+        </form>
+      </section>
+
+      <!-- Runtime AWS RDS MySQL & S3 Connection (Published Hosts without .env) -->
+      <section class="rounded-xl border border-slate-200 bg-white p-5 sm:p-6 space-y-4">
+        <div class="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h2 class="text-sm font-bold text-[#0F172A] font-display">AWS RDS MySQL &amp; S3 Runtime Connection</h2>
+            <p class="mt-0.5 text-xs text-slate-600">
+              Connect a published host (where <code class="font-mono text-[11px]">.env</code> is omitted) directly to your shared AWS RDS MySQL &amp; S3 storage. For permanent persistence across container restarts, also add these keys in Cloud Run / Render Environment Variables.
+            </p>
+          </div>
+          @if (integrationStatus(); as st) {
+            <span
+              class="rounded-md px-2.5 py-1 font-mono text-[11px] font-semibold"
+              [class.bg-emerald-50]="st.database.connected"
+              [class.text-emerald-800]="st.database.connected"
+              [class.bg-amber-50]="!st.database.connected"
+              [class.text-amber-800]="!st.database.connected"
+            >
+              {{ st.database.connected ? 'Live RDS Connected' : 'In-Memory Fallback' }}
+            </span>
+          }
+        </div>
+
+        <form [formGroup]="dbForm" (ngSubmit)="saveDatabaseConfig()" class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          <div class="sm:col-span-2">
+            <label for="db-host" class="block text-xs font-semibold text-slate-700 mb-1">AWS RDS Host (DB_HOST)</label>
+            <input id="db-host" type="text" formControlName="host" placeholder="your-rds-instance.ap-south-1.rds.amazonaws.com" class="w-full h-10 rounded-lg border border-slate-300 px-3 font-mono text-xs" />
+          </div>
+          <div>
+            <label for="db-port" class="block text-xs font-semibold text-slate-700 mb-1">Port (DB_PORT)</label>
+            <input id="db-port" type="number" formControlName="port" class="w-full h-10 rounded-lg border border-slate-300 px-3 font-mono text-xs" />
+          </div>
+          <div>
+            <label for="db-name" class="block text-xs font-semibold text-slate-700 mb-1">Database Name (DB_NAME)</label>
+            <input id="db-name" type="text" formControlName="database" placeholder="secure_qr_verification" class="w-full h-10 rounded-lg border border-slate-300 px-3 font-mono text-xs" />
+          </div>
+          <div>
+            <label for="db-user" class="block text-xs font-semibold text-slate-700 mb-1">DB Username (DB_USER)</label>
+            <input id="db-user" type="text" formControlName="user" placeholder="RDS admin username" class="w-full h-10 rounded-lg border border-slate-300 px-3 font-mono text-xs" />
+          </div>
+          <div>
+            <label for="db-pass" class="block text-xs font-semibold text-slate-700 mb-1">DB Password (DB_PASSWORD)</label>
+            <input id="db-pass" type="password" formControlName="password" autocomplete="new-password" placeholder="RDS password" class="w-full h-10 rounded-lg border border-slate-300 px-3 text-xs" />
+          </div>
+          <div>
+            <label for="s3-bucket" class="block text-xs font-semibold text-slate-700 mb-1">S3 Bucket (Optional)</label>
+            <input id="s3-bucket" type="text" formControlName="awsBucket" placeholder="sathayushstorage" class="w-full h-10 rounded-lg border border-slate-300 px-3 font-mono text-xs" />
+          </div>
+          <div>
+            <label for="s3-region" class="block text-xs font-semibold text-slate-700 mb-1">S3 Region (Optional)</label>
+            <input id="s3-region" type="text" formControlName="awsRegion" placeholder="ap-south-1" class="w-full h-10 rounded-lg border border-slate-300 px-3 font-mono text-xs" />
+          </div>
+          <div>
+            <label for="s3-filepath" class="block text-xs font-semibold text-slate-700 mb-1">S3 File Base URL (Optional)</label>
+            <input id="s3-filepath" type="url" formControlName="filePath" placeholder="https://bucket.s3.region.amazonaws.com/prefix/" class="w-full h-10 rounded-lg border border-slate-300 px-3 font-mono text-xs" />
+          </div>
+          <div>
+            <label for="s3-ak" class="block text-xs font-semibold text-slate-700 mb-1">AWS Access Key ID (Optional)</label>
+            <input id="s3-ak" type="text" formControlName="awsAccessKeyId" placeholder="AKIA..." class="w-full h-10 rounded-lg border border-slate-300 px-3 font-mono text-xs" />
+          </div>
+          <div>
+            <label for="s3-sk" class="block text-xs font-semibold text-slate-700 mb-1">AWS Secret Key (Optional)</label>
+            <input id="s3-sk" type="password" formControlName="awsSecretAccessKey" autocomplete="new-password" placeholder="Leave blank to keep existing" class="w-full h-10 rounded-lg border border-slate-300 px-3 text-xs" />
+          </div>
+          <div class="flex items-end justify-end">
+            <button
+              type="submit"
+              [disabled]="savingDb()"
+              class="touch-target inline-flex items-center justify-center gap-2 rounded-lg bg-[#0F172A] px-5 py-2.5 text-xs font-semibold text-white hover:bg-[#1E3A5F] disabled:opacity-50 whitespace-nowrap"
+            >
+              <mat-icon class="text-[18px]!">storage</mat-icon>
+              <span>{{ savingDb() ? 'Connecting RDS...' : 'Connect & Sync RDS' }}</span>
             </button>
           </div>
         </form>
@@ -399,11 +477,13 @@ import {ToastService} from '../../core/services/toast.service';
 export class AdminSettings implements OnInit {
   private readonly fb = inject(FormBuilder);
   private readonly api = inject(ApiService);
+  private readonly auth = inject(AuthService);
   private readonly toast = inject(ToastService);
 
   protected readonly Number = Number;
   protected readonly fieldConfigs = signal<Record<string, unknown>[]>([]);
   protected readonly initializingDb = signal(false);
+  protected readonly savingDb = signal(false);
   protected readonly savingEmail = signal(false);
   protected readonly testingEmail = signal(false);
   protected readonly integrationStatus = signal<{
@@ -458,6 +538,19 @@ export class AdminSettings implements OnInit {
     allow_multiple_active_qr: ['false'],
   });
 
+  protected readonly dbForm = this.fb.group({
+    host: ['', Validators.required],
+    port: [3306],
+    database: ['secure_qr_verification', Validators.required],
+    user: ['', Validators.required],
+    password: [''],
+    awsBucket: [''],
+    awsRegion: ['ap-south-1'],
+    filePath: [''],
+    awsAccessKeyId: [''],
+    awsSecretAccessKey: [''],
+  });
+
   protected readonly emailForm = this.fb.group({
     provider: ['https-webhook'],
     defaultFromEmail: ['kishore.sathayush@gmail.com'],
@@ -493,6 +586,13 @@ export class AdminSettings implements OnInit {
       try {
         const status = await firstValueFrom(this.api.getIntegrationStatus());
         this.integrationStatus.set(status);
+        this.dbForm.patchValue({
+          host: status.database.host && status.database.host !== 'in-memory-mock' ? status.database.host : '',
+          database: status.database.database || 'secure_qr_verification',
+          awsBucket: status.integrations.s3Bucket || '',
+          awsRegion: status.integrations.s3Region || 'ap-south-1',
+          filePath: status.integrations.filePath || '',
+        });
         if (status.emailSettings) {
           const es = status.emailSettings;
           const selectedProvider =
@@ -572,6 +672,50 @@ export class AdminSettings implements OnInit {
       this.toast.error('Test Error', msg);
     } finally {
       this.testingEmail.set(false);
+    }
+  }
+
+  async saveDatabaseConfig(): Promise<void> {
+    if (this.dbForm.invalid) {
+      this.toast.error('Missing Fields', 'Enter DB Host, DB Name, and DB Username.');
+      return;
+    }
+    this.savingDb.set(true);
+    try {
+      const v = this.dbForm.value;
+      const res = await firstValueFrom(
+        this.api.saveDatabaseConfig({
+          host: v.host,
+          port: v.port || 3306,
+          database: v.database,
+          user: v.user,
+          password: v.password,
+          ssl: true,
+          awsBucket: v.awsBucket,
+          awsRegion: v.awsRegion,
+          filePath: v.filePath,
+          awsAccessKeyId: v.awsAccessKeyId,
+          awsSecretAccessKey: v.awsSecretAccessKey,
+        }),
+      );
+      if (res.accessToken && res.refreshToken) {
+        this.auth.updateSessionTokens(
+          res.accessToken,
+          res.refreshToken,
+          res.user as AuthUser | undefined,
+        );
+      }
+      this.dbForm.patchValue({password: '', awsSecretAccessKey: ''});
+      this.toast.success('AWS RDS Connected', res.message);
+      await this.load();
+    } catch (err: unknown) {
+      const msg =
+        (err as {error?: {message?: string; error?: string}})?.error?.message ||
+        (err as {error?: {error?: string}})?.error?.error ||
+        'Could not connect to AWS RDS MySQL.';
+      this.toast.error('RDS Connection Failed', msg);
+    } finally {
+      this.savingDb.set(false);
     }
   }
 

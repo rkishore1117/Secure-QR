@@ -372,6 +372,19 @@ export class ApiService {
     }>('/api/v1/admin/settings/email/test', recipientEmail ? {recipientEmail} : {});
   }
 
+  saveDatabaseConfig(payload: Record<string, unknown>) {
+    return this.http.post<{
+      success: boolean;
+      host: string;
+      database: string;
+      message: string;
+      error?: string;
+      accessToken?: string;
+      refreshToken?: string;
+      user?: Record<string, unknown>;
+    }>('/api/v1/admin/settings/database', payload);
+  }
+
   initMysqlDatabase() {
     return this.http.post<{
       success: boolean;
